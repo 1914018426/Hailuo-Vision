@@ -125,9 +125,10 @@ export function VideoGrid({
             detection={detections[cameraId] || {
               camera_id: cameraId,
               person_count: 0,
-              gesture: 'none',
-              gesture_confidence: 0,
-              poses: [],
+              detections: [],
+              best_gesture: 'none',
+              best_gesture_confidence: 0,
+              inference_ms: 0,
               timestamp: 0,
             }}
           />

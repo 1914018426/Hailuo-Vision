@@ -500,15 +500,15 @@ def _build_enhanced_markdown(report: AnalysisReport) -> str:
         lines.append(svg_bar_chart(calib_data, "置信度校准度对比", value_fmt="{:.1f}"))
         lines.append("</div>\n")
 
-        # 雷达图
+        # 雷达图（效率维度使用 inference_count 代替 mean_latency_ms，避免异步推理的虚假延迟）
         max_detection = max(s.detection_rate for s in report.engine_stats) or 0.001
-        max_latency = max(s.mean_latency_ms for s in report.engine_stats) or 0.001
+        max_inference = max(s.inference_count for s in report.engine_stats) or 0.001
         max_fp = max(s.false_positive_estimate for s in report.engine_stats) or 0.001
         # 校准度已天然在 0~1，无需额外归一化
         max_calibration = max(report.calibration_scores.values()) or 0.001
-        dimensions = ["检测率", "置信度校准度", "鲁棒性", "推理速度", "精度"]
+        dimensions = ["检测率", "置信度校准度", "鲁棒性", "资源效率", "精度"]
         radar_data = []
-        for i, dim_key in enumerate(["detection_rate", "calibration", "robustness", "latency", "precision"]):
+        for i, dim_key in enumerate(["detection_rate", "calibration", "robustness", "efficiency", "precision"]):
             row: Dict[str, Any] = {}
             for s in report.engine_stats:
                 if dim_key == "detection_rate":
@@ -517,8 +517,9 @@ def _build_enhanced_markdown(report: AnalysisReport) -> str:
                     row[s.engine_name] = min(1.0, report.calibration_scores.get(s.engine_name, 0.0) / max_calibration)
                 elif dim_key == "robustness":
                     row[s.engine_name] = max(0.0, 1.0 - s.noise_rejection_rate)
-                elif dim_key == "latency":
-                    row[s.engine_name] = max(0.0, 1.0 - s.mean_latency_ms / max_latency)
+                elif dim_key == "efficiency":
+                    # inference_count 越少 = 资源效率越高（MiniCPM 推理次数是真实 GPU 成本）
+                    row[s.engine_name] = max(0.0, 1.0 - s.inference_count / max_inference)
                 elif dim_key == "precision":
                     row[s.engine_name] = max(0.0, 1.0 - s.false_positive_estimate / max_fp)
             radar_data.append(row)
@@ -755,15 +756,14 @@ def _build_enhanced_markdown(report: AnalysisReport) -> str:
     # ------------------------------------------------------------------
     # STH 优势指标
     # ------------------------------------------------------------------
-    adv = report.simple_transformer_advantage
+    adv = report.simple_minicpm_advantage
     if adv.overall_score > 0:
-        lines.append("## SimpleTransformerHybrid 优势量化\n")
+        lines.append("## Simple+MiniCPM 优势量化\n")
         lines.append("| 指标 | 数值 |")
         lines.append("|------|------|")
         lines.append(f"| vs Simple 精度提升 | +{adv.vs_simple_precision_gain:.1f}% |")
-        lines.append(f"| vs Transformer 召回提升 | +{adv.vs_transformer_recall_gain:.1f}% |")
-        lines.append(f"| soft-filter 挽救率 | {adv.soft_filter_rescue_rate:.1f}% |")
-        lines.append(f"| 静止鲁棒性提升 | {adv.noise_rejection_score:.1f}% |")
+        lines.append(f"| vs MiniCPM 召回提升 | +{adv.vs_minicpm_recall_gain:.1f}% |")
+        lines.append(f"| 噪声拒绝得分 | {adv.noise_rejection_score:.1f}% |")
         lines.append(f"| 推理效率增益 | {adv.latency_efficiency_gain:.1f}% |")
         lines.append(f"| **综合得分** | **{adv.overall_score:.1f}** |")
         lines.append("")
@@ -814,9 +814,9 @@ def _generate_all_chart_svgs(report: AnalysisReport) -> Dict[str, str]:
         ]
         charts["03_calibration.svg"] = svg_bar_chart(calib_data, "置信度校准度对比", value_fmt="{:.1f}")
 
-        # 3b. 雷达图
+        # 3b. 雷达图（效率维度使用 inference_count 代替 mean_latency_ms）
         max_detection = max(s.detection_rate for s in report.engine_stats) or 0.001
-        max_latency = max(s.mean_latency_ms for s in report.engine_stats) or 0.001
+        max_inference = max(s.inference_count for s in report.engine_stats) or 0.001
         # 精度维度使用 cross-sample precision（与前端雷达图保持一致）
         prf_precision = {
             s.engine_name: report.precision_recall_f1.get(s.engine_name, {}).get("precision", 0.0)
@@ -825,9 +825,9 @@ def _generate_all_chart_svgs(report: AnalysisReport) -> Dict[str, str]:
         max_precision = max(prf_precision.values()) or 0.001
         # 校准度已天然在 0~1，无需额外归一化
         max_calibration = max(report.calibration_scores.values()) or 0.001
-        dimensions = ["检测率", "置信度校准度", "鲁棒性", "推理速度", "精度"]
+        dimensions = ["检测率", "置信度校准度", "鲁棒性", "资源效率", "精度"]
         radar_data = []
-        for i, dim_key in enumerate(["detection_rate", "calibration", "robustness", "latency", "precision"]):
+        for i, dim_key in enumerate(["detection_rate", "calibration", "robustness", "efficiency", "precision"]):
             row: Dict[str, Any] = {}
             for s in report.engine_stats:
                 if dim_key == "detection_rate":
@@ -836,8 +836,9 @@ def _generate_all_chart_svgs(report: AnalysisReport) -> Dict[str, str]:
                     row[s.engine_name] = min(1.0, report.calibration_scores.get(s.engine_name, 0.0) / max_calibration)
                 elif dim_key == "robustness":
                     row[s.engine_name] = max(0.0, 1.0 - s.noise_rejection_rate)
-                elif dim_key == "latency":
-                    row[s.engine_name] = max(0.0, 1.0 - s.mean_latency_ms / max_latency)
+                elif dim_key == "efficiency":
+                    # inference_count 越少 = 资源效率越高
+                    row[s.engine_name] = max(0.0, 1.0 - s.inference_count / max_inference)
                 elif dim_key == "precision":
                     row[s.engine_name] = min(1.0, prf_precision.get(s.engine_name, 0.0) / max_precision)
             radar_data.append(row)
@@ -1143,17 +1144,16 @@ def _build_pdf_html(report: AnalysisReport) -> str:
 
     # STH 优势
     sth_html = ""
-    adv = report.simple_transformer_advantage
+    adv = report.simple_minicpm_advantage
     if adv.overall_score > 0:
         sth_html = f"""
-        <h2>SimpleTransformerHybrid 优势量化</h2>
+        <h2>Simple+MiniCPM 优势量化</h2>
         <table>
             <thead><tr><th>指标</th><th>数值</th></tr></thead>
             <tbody>
                 <tr><td>vs Simple 精度提升</td><td>+{adv.vs_simple_precision_gain:.1f}%</td></tr>
-                <tr><td>vs Transformer 召回提升</td><td>+{adv.vs_transformer_recall_gain:.1f}%</td></tr>
-                <tr><td>soft-filter 挽救率</td><td>{adv.soft_filter_rescue_rate:.1f}%</td></tr>
-                <tr><td>静止鲁棒性提升</td><td>{adv.noise_rejection_score:.1f}%</td></tr>
+                <tr><td>vs MiniCPM 召回提升</td><td>+{adv.vs_minicpm_recall_gain:.1f}%</td></tr>
+                <tr><td>噪声拒绝得分</td><td>{adv.noise_rejection_score:.1f}%</td></tr>
                 <tr><td>推理效率增益</td><td>{adv.latency_efficiency_gain:.1f}%</td></tr>
                 <tr><td><strong>综合得分</strong></td><td><strong>{adv.overall_score:.1f}</strong></td></tr>
             </tbody>

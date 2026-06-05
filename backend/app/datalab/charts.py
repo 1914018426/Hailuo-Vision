@@ -21,6 +21,13 @@ ENGINE_COLORS = {
     "simple_no_periodicity": "#fb923c",
     "simple_no_pose_gate": "#a78bfa",
     "triplelock_no_orientation": "#38bdf8",
+    "simple_minicpm": "#f472b6",
+    "minicpm": "#22d3ee",
+    "simple_minicpm_full": "#f472b6",
+    "simple_minicpm_no_simple_gate": "#fbbf24",
+    "simple_minicpm_no_cooldown": "#c084fc",
+    "minicpm_full": "#22d3ee",
+    "simple_full": "#94a3b8",
 }
 
 ENGINE_LABELS_SHORT = {
@@ -37,6 +44,13 @@ ENGINE_LABELS_SHORT = {
     "simple_no_periodicity": "-period",
     "simple_no_pose_gate": "-pose",
     "triplelock_no_orientation": "-orient",
+    "simple_minicpm": "S+M",
+    "minicpm": "MCPM",
+    "simple_minicpm_full": "S+M",
+    "simple_minicpm_no_simple_gate": "-gate",
+    "simple_minicpm_no_cooldown": "-cd",
+    "minicpm_full": "MCPM",
+    "simple_full": "Simple",
 }
 
 

@@ -292,6 +292,51 @@ class AIConfig:
         default_factory=lambda: _env_float("TRANSFORMER_CONFIDENCE_THRESHOLD", 0.5)
     )
 
+    # --- MiniCPM 视频手势引擎 ---
+    minicpm_model_path: str = field(
+        default_factory=lambda: _env_str(
+            "MINICPM_MODEL_PATH", "OpenBMB/MiniCPM-V-4.6"
+        )
+    )
+    minicpm_input_size: int = field(
+        default_factory=lambda: _env_int("MINICPM_INPUT_SIZE", 448)
+    )
+    minicpm_max_frames: int = field(
+        default_factory=lambda: _env_int("MINICPM_MAX_FRAMES", 16)
+    )
+    minicpm_buffer_seconds: float = field(
+        default_factory=lambda: _env_float("MINICPM_BUFFER_SECONDS", 2.5)
+    )
+    minicpm_min_frames: int = field(
+        default_factory=lambda: _env_int("MINICPM_MIN_FRAMES", 4)
+    )
+    # 缩短推理间隔，提高视频覆盖度；取消冷却期，持续招手场景不遗漏
+    minicpm_infer_interval_s: float = field(
+        default_factory=lambda: _env_float("MINICPM_INFER_INTERVAL_S", 0.2)
+    )
+    minicpm_max_concurrent: int = field(
+        default_factory=lambda: _env_int("MINICPM_MAX_CONCURRENT", 16)
+    )
+    minicpm_confidence_threshold: float = field(
+        default_factory=lambda: _env_float("MINICPM_CONFIDENCE_THRESHOLD", 0.6)
+    )
+    minicpm_cooldown_seconds: float = field(
+        default_factory=lambda: _env_float("MINICPM_COOLDOWN_SECONDS", 0.0)
+    )
+    # MiniCPM 推理 Prompt，可通过环境变量自定义
+    minicpm_prompt: str = field(
+        default_factory=lambda: _env_str(
+            "MINICPM_PROMPT",
+            "These frames are from a roadside surveillance camera. "
+            "The person in the video is facing the camera. "
+            "Is the person raising or waving their hand toward the camera, "
+            "as if greeting someone or hailing a vehicle? "
+            "Do NOT count scratching head, holding a phone, shielding eyes from sun, "
+            "or other non-greeting gestures. "
+            "Answer only 'yes' or 'no'.",
+        )
+    )
+
 
 @dataclass
 class ServerConfig:

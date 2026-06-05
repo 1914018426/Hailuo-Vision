@@ -4,7 +4,7 @@ export type CameraId = string;
 
 export type Protocol = 'rtsp' | 'rtmp' | 'http' | 'webrtc' | 'local' | 'file';
 
-export type Gesture = 'waving' | 'hand_up' | 'none';
+export type Gesture = 'waving' | 'hand_up' | 'checking' | 'none';
 
 // ========== 显示配置 ==========
 
@@ -143,8 +143,8 @@ export const CAMERA_SHORT_LABELS = DEFAULT_CAMERA_SHORT_LABELS;
 
 export const GESTURE_LABELS: Record<Gesture, string> = {
   waving: '招手',
-
   hand_up: '举手',
+  checking: '检测中',
   none: '无手势',
 };
 

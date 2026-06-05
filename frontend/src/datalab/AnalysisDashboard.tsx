@@ -30,34 +30,14 @@ interface AnalysisDashboardProps {
 
 const ENGINE_COLORS: Record<string, string> = {
   simple: '#94a3b8',
-  transformer: '#60a5fa',
-  triplelock: '#c084fc',
-  transformer_triplelock: '#fbbf24',
-  simple_transformer: '#34d399',
-  sth_full: '#34d399',
-  sth_no_softfilter: '#f87171',
-  sth_no_velocity_gate: '#fbbf24',
-  sth_no_pose_gate: '#c084fc',
-  sth_transformer_only: '#60a5fa',
-  simple_no_periodicity: '#fb923c',
-  simple_no_pose_gate: '#a78bfa',
-  triplelock_no_orientation: '#38bdf8',
+  simple_minicpm: '#34d399',
+  minicpm: '#60a5fa',
 };
 
 const ENGINE_LABELS: Record<string, string> = {
   simple: 'Simple',
-  transformer: 'Transformer',
-  triplelock: 'TripleLock',
-  transformer_triplelock: 'Transformer+TripleLock',
-  simple_transformer: 'Simple+Transformer',
-  sth_full: 'STH 完整',
-  sth_no_softfilter: 'STH -soft-filter',
-  sth_no_velocity_gate: 'STH -速度门',
-  sth_no_pose_gate: 'STH -姿态门',
-  sth_transformer_only: 'STH TransformerOnly',
-  simple_no_periodicity: 'Simple -周期性',
-  simple_no_pose_gate: 'Simple -姿态门',
-  triplelock_no_orientation: 'TL -朝向锁',
+  simple_minicpm: 'Simple+MiniCPM ★',
+  minicpm: 'MiniCPM',
 };
 
 const TAB_OPTIONS = [
@@ -186,8 +166,8 @@ export function AnalysisDashboard({ experimentId, onRequestNew }: AnalysisDashbo
 // ------------------------------------------------------------------
 
 function SummaryCards({ report }: { report: AnalysisReport }) {
-  const sth = report.engine_stats.find((s) => s.engine_name === 'simple_transformer');
-  const adv = report.simple_transformer_advantage;
+  const smc = report.engine_stats.find((s) => s.engine_name === 'simple_minicpm');
+  const adv = report.simple_minicpm_advantage;
 
   let bestF1 = -1;
   let bestF1Engine = '';
@@ -207,12 +187,12 @@ function SummaryCards({ report }: { report: AnalysisReport }) {
         description={`共识基线: ${report.consensus_baseline_frames} 帧`}
         color="blue"
       />
-      {sth && (
+      {smc && (
         <HighlightCard
-          title="Simple+Transformer 检测率"
-          value={(sth.detection_rate * 100).toFixed(1)}
+          title="Simple+MiniCPM 检测率"
+          value={(smc.detection_rate * 100).toFixed(1)}
           unit="%"
-          description={`${sth.waving_frames} 帧 waving / ${sth.positive_segments} 片段`}
+          description={`${smc.waving_frames} 帧 waving / ${smc.positive_segments} 片段`}
           color="green"
         />
       )}
@@ -331,13 +311,13 @@ function RadarComparisonChart({ stats, prf1, calibrationScores }: { stats: Engin
     { key: 'detection_rate', label: '检测率', max: 1 },
     { key: 'calibration', label: '置信度校准度', max: 1 },
     { key: 'robustness', label: '鲁棒性', max: 1 },
-    { key: 'latency', label: '推理速度', max: 1 },
+    { key: 'efficiency', label: '资源效率', max: 1 },
     { key: 'precision', label: '精度', max: 1 },
   ];
 
   const data = useMemo(() => {
     const maxDetection = Math.max(...stats.map((s) => s.detection_rate), 0.001);
-    const maxLatency = Math.max(...stats.map((s) => s.mean_latency_ms), 0.001);
+    const maxInference = Math.max(...stats.map((s) => s.inference_count), 0.001);
     const maxFp = Math.max(...stats.map((s) => s.false_positive_estimate), 0.001);
     const maxCalib = Math.max(...Object.values(calibrationScores || {}), 0.001);
 
@@ -349,7 +329,7 @@ function RadarComparisonChart({ stats, prf1, calibrationScores }: { stats: Engin
         else if (dim.key === 'calibration') val = (calibrationScores?.[s.engine_name] || 0) / maxCalib;
         else if (dim.key === 'robustness')
           val = Math.max(0, 1 - s.noise_rejection_rate);
-        else if (dim.key === 'latency') val = Math.max(0, 1 - s.mean_latency_ms / maxLatency);
+        else if (dim.key === 'efficiency') val = Math.max(0, 1 - s.inference_count / maxInference);
         else if (dim.key === 'precision') {
           // 优先使用跨正负样本计算的 precision（TP / (TP + FP)）
           const crossPrecision = prf1?.[s.engine_name]?.precision;
@@ -383,8 +363,8 @@ function RadarComparisonChart({ stats, prf1, calibrationScores }: { stats: Engin
               dataKey={s.engine_name}
               stroke={ENGINE_COLORS[s.engine_name] || '#94a3b8'}
               fill={ENGINE_COLORS[s.engine_name] || '#94a3b8'}
-              fillOpacity={s.engine_name === 'simple_transformer' ? 0.35 : 0.05}
-              strokeWidth={s.engine_name === 'simple_transformer' ? 3 : 1.5}
+              fillOpacity={s.engine_name === 'simple_minicpm' ? 0.35 : 0.05}
+              strokeWidth={s.engine_name === 'simple_minicpm' ? 3 : 1.5}
             />
           ))}
           <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
@@ -830,32 +810,28 @@ function ConclusionSection({
 
   return (
     <div className="space-y-4">
-      {report.simple_transformer_advantage.overall_score > 0 && (
+      {report.simple_minicpm_advantage.overall_score > 0 && (
         <div className="rounded-xl border border-emerald-800/40 bg-emerald-900/10 p-5">
           <h3 className="mb-3 flex items-center gap-2 text-base font-semibold text-emerald-400">
             <Award className="h-5 w-5" />
-            SimpleTransformerHybrid 优势分析
+            Simple+MiniCPM 优势分析
           </h3>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
             <MetricItem
               label="vs Simple 精度提升"
-              value={`+${report.simple_transformer_advantage.vs_simple_precision_gain.toFixed(1)}%`}
+              value={`+${report.simple_minicpm_advantage.vs_simple_precision_gain.toFixed(1)}%`}
             />
             <MetricItem
-              label="vs Transformer 召回提升"
-              value={`+${report.simple_transformer_advantage.vs_transformer_recall_gain.toFixed(1)}%`}
-            />
-            <MetricItem
-              label="soft-filter 挽救率"
-              value={`${report.simple_transformer_advantage.soft_filter_rescue_rate.toFixed(1)}%`}
+              label="vs MiniCPM 召回提升"
+              value={`+${report.simple_minicpm_advantage.vs_minicpm_recall_gain.toFixed(1)}%`}
             />
             <MetricItem
               label="静止鲁棒性提升"
-              value={`${report.simple_transformer_advantage.noise_rejection_score.toFixed(1)}%`}
+              value={`${report.simple_minicpm_advantage.noise_rejection_score.toFixed(1)}%`}
             />
             <MetricItem
               label="推理效率增益"
-              value={`${report.simple_transformer_advantage.latency_efficiency_gain.toFixed(1)}%`}
+              value={`${report.simple_minicpm_advantage.latency_efficiency_gain.toFixed(1)}%`}
             />
           </div>
         </div>
@@ -997,21 +973,21 @@ function StatsTable({
         </thead>
         <tbody className="divide-y divide-slate-800">
           {stats.map((s) => {
-            const isSth = s.engine_name === 'simple_transformer';
+            const isSmc = s.engine_name === 'simple_minicpm';
             const f1Data = prf1[s.engine_name];
             const calib = calibrationScores?.[s.engine_name] ?? 0;
             return (
               <tr
                 key={s.engine_name}
-                className={`${isSth ? 'bg-emerald-500/5' : 'hover:bg-slate-800/50'}`}
+                className={`${isSmc ? 'bg-emerald-500/5' : 'hover:bg-slate-800/50'}`}
               >
                 <td
                   className={`px-4 py-3 font-medium ${
-                    isSth ? 'text-emerald-400' : 'text-slate-300'
+                    isSmc ? 'text-emerald-400' : 'text-slate-300'
                   }`}
                 >
                   {ENGINE_LABELS[s.engine_name] || s.engine_name}
-                  {isSth && ' ★'}
+                  {isSmc && ' ★'}
                 </td>
                 <td className="px-4 py-3 text-slate-400">
                   {(s.detection_rate * 100).toFixed(1)}%
@@ -1022,7 +998,7 @@ function StatsTable({
                 <td className="px-4 py-3 text-slate-400">
                   {f1Data ? (f1Data.recall * 100).toFixed(1) : '-'}%
                 </td>
-                <td className={`px-4 py-3 font-medium ${isSth ? 'text-emerald-300' : 'text-slate-400'}`}>
+                <td className={`px-4 py-3 font-medium ${isSmc ? 'text-emerald-300' : 'text-slate-400'}`}>
                   {f1Data ? f1Data.f1.toFixed(3) : '-'}
                 </td>
                 <td className="px-4 py-3 text-slate-400">{calib.toFixed(3)}</td>

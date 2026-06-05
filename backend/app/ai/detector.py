@@ -294,10 +294,14 @@ class PoseDetector:
         # 原始手腕像素历史（用于静态区域过滤，绝对不能用 EMA 平滑）
         # camera_id -> {track_id_side -> deque[(raw_x, raw_y), ...]}
         self._raw_wrist_history: Dict[str, Dict[str, deque]] = {}
-        # 手势识别器（懒加载，支持 triplelock / transformer / hybrid 模式）
+        # 手势识别器（支持 triplelock / transformer / hybrid / simple-minicpm 模式）
         self._recognizer = None
+        self._recognizer_mode = self.config.ai.gesture_engine.lower()
         # DataLab 录制器（由 main.py 注入）
         self._datalab_recorder = None
+
+        # 预加载手势识别器（simple-minicpm 模式下后台常驻 MiniCPM）
+        self._preload_recognizer()
 
         logger.info(
             "PoseDetector 初始化完成: model=%s, conf=%.2f, max_det=%d, "
@@ -309,6 +313,21 @@ class PoseDetector:
             self.use_tracking,
             self.use_mediapipe,
         )
+
+    def _preload_recognizer(self) -> None:
+        """后台预加载手势识别器，避免首次检测时的模型加载延迟。"""
+        engine_mode = self.config.ai.gesture_engine.lower()
+        if engine_mode not in ("simple-minicpm",):
+            return
+        try:
+            from app.ai.gesture import _choose_recognizer
+            self._recognizer = _choose_recognizer()
+            logger.info(
+                "手势识别器已预加载: %s",
+                self._recognizer.__class__.__name__,
+            )
+        except Exception as e:
+            logger.warning("手势识别器预加载失败: %s", e)
 
     def _load_yolo_model(self):
         """
@@ -429,6 +448,7 @@ class PoseDetector:
                     half=self.config.ai.inference_half,
                     tracker=self.tracker_config,
                     persist=True,
+                    device=0,
                 )
             else:
                 # 纯检测模式（无跟踪）
@@ -439,6 +459,7 @@ class PoseDetector:
                     verbose=False,
                     imgsz=self.config.ai.inference_imgsz,
                     half=self.config.ai.inference_half,
+                    device=0,
                 )
 
             for result in yolo_results:
@@ -807,8 +828,8 @@ class PoseDetector:
                 pass
 
             # 根据识别器类型选择调用方式
-            from app.ai.gesture import TransformerGestureRecognizer, HybridGestureRecognizer, SimpleGestureRecognizer, SimpleTransformerHybridRecognizer
-            if isinstance(recognizer, (TransformerGestureRecognizer, HybridGestureRecognizer, SimpleGestureRecognizer, SimpleTransformerHybridRecognizer)):
+            from app.ai.gesture import TransformerGestureRecognizer, HybridGestureRecognizer, SimpleGestureRecognizer, SimpleTransformerHybridRecognizer, SimpleMiniCPMHybridRecognizer
+            if isinstance(recognizer, (TransformerGestureRecognizer, HybridGestureRecognizer, SimpleGestureRecognizer, SimpleTransformerHybridRecognizer, SimpleMiniCPMHybridRecognizer)):
                 result = recognizer.recognize(
                     sm_kpts, person.track_id,
                     left_palm_normal=person.left_palm_normal,
@@ -823,6 +844,8 @@ class PoseDetector:
                     right_velocity_mag=right_vmag,
                     left_theta1=left_t1, left_theta2=left_t2, left_ext_ratio=left_ext,
                     right_theta1=right_t1, right_theta2=right_t2, right_ext_ratio=right_ext,
+                    frame=frame,
+                    bbox=person.bbox,
                 )
                 gesture_type = result.gesture_type.value if isinstance(result.gesture_type, GestureType) else str(result.gesture_type)
                 gesture_conf = result.confidence
@@ -845,37 +868,38 @@ class PoseDetector:
             self._update_gesture_trail(person, camera_id, frame_ts)
 
             # ---- 原始手腕像素静态区域过滤 ----
-            # 用户要求：当手势轨迹长期只限定在手腕周围的一小块面积时，
-            # 无论它做怎样的运动都判为静止。必须使用原始未平滑像素坐标。
-            RAW_WRIST_RANGE_THRESHOLD = 15.0   # px；小幅挥手可能仅 10-12px
-            RAW_WRIST_MIN_HISTORY = 8          # 约 0.5s@15fps
-            if camera_id not in self._raw_wrist_history:
-                self._raw_wrist_history[camera_id] = {}
-            cam_raw_hist = self._raw_wrist_history[camera_id]
-            tid = person.track_id
-            for side, w_idx in [("left", 9), ("right", 10)]:
-                trail_key = f"{tid}_{side}"
-                hist = cam_raw_hist.get(trail_key)
-                if hist is None:
-                    hist = deque(maxlen=15)
-                    cam_raw_hist[trail_key] = hist
-                kpts = person.keypoints
-                if len(kpts) > w_idx and kpts[w_idx][2] > 0.3:
-                    hist.append((float(kpts[w_idx][0]), float(kpts[w_idx][1])))
-                # 若当前已识别出手势，检查原始像素范围
-                if person.gesture != "none" and len(hist) >= RAW_WRIST_MIN_HISTORY:
-                    xs = [p[0] for p in hist]
-                    ys = [p[1] for p in hist]
-                    range_x = max(xs) - min(xs)
-                    range_y = max(ys) - min(ys)
-                    if range_x < RAW_WRIST_RANGE_THRESHOLD and range_y < RAW_WRIST_RANGE_THRESHOLD:
-                        logger.info(
-                            "静态过滤(raw): track=%s side=%s range=(%.1fpx,%.1fpx) < %.1f, 强制 none",
-                            tid, side, range_x, range_y, RAW_WRIST_RANGE_THRESHOLD,
-                        )
-                        person.gesture = "none"
-                        person.gesture_conf = 0.0
-                        break  # 一只手被过滤即认为该人静止
+            # 仅对 TripleLock/Simple 等传统引擎生效；simple-minicpm 模式下
+            # CHECKING 只是等待 MiniCPM 视频分析的中间态，不应被静态过滤提前取消。
+            if self._recognizer_mode != "simple-minicpm":
+                RAW_WRIST_RANGE_THRESHOLD = 15.0   # px；小幅挥手可能仅 10-12px
+                RAW_WRIST_MIN_HISTORY = 8          # 约 0.5s@15fps
+                if camera_id not in self._raw_wrist_history:
+                    self._raw_wrist_history[camera_id] = {}
+                cam_raw_hist = self._raw_wrist_history[camera_id]
+                tid = person.track_id
+                for side, w_idx in [("left", 9), ("right", 10)]:
+                    trail_key = f"{tid}_{side}"
+                    hist = cam_raw_hist.get(trail_key)
+                    if hist is None:
+                        hist = deque(maxlen=15)
+                        cam_raw_hist[trail_key] = hist
+                    kpts = person.keypoints
+                    if len(kpts) > w_idx and kpts[w_idx][2] > 0.3:
+                        hist.append((float(kpts[w_idx][0]), float(kpts[w_idx][1])))
+                    # 若当前已识别出手势，检查原始像素范围
+                    if person.gesture != "none" and len(hist) >= RAW_WRIST_MIN_HISTORY:
+                        xs = [p[0] for p in hist]
+                        ys = [p[1] for p in hist]
+                        range_x = max(xs) - min(xs)
+                        range_y = max(ys) - min(ys)
+                        if range_x < RAW_WRIST_RANGE_THRESHOLD and range_y < RAW_WRIST_RANGE_THRESHOLD:
+                            logger.info(
+                                "静态过滤(raw): track=%s side=%s range=(%.1fpx,%.1fpx) < %.1f, 强制 none",
+                                tid, side, range_x, range_y, RAW_WRIST_RANGE_THRESHOLD,
+                            )
+                            person.gesture = "none"
+                            person.gesture_conf = 0.0
+                            break  # 一只手被过滤即认为该人静止
 
             if person.gesture != "none":
                 logger.info(
@@ -1076,6 +1100,9 @@ class PoseDetector:
             elif person.gesture == "hand_up":
                 box_color = (128, 128, 128)  # 灰色 - 举手
                 label = f"HandUp {person.gesture_conf:.2f}"
+            elif person.gesture == "checking":
+                box_color = (0, 165, 255)  # 橙色 - MiniCPM 检测中
+                label = f"Checking {person.gesture_conf:.2f}"
             else:
                 box_color = (0, 255, 0)    # 绿色 - 无手势
                 label = f"Person {person.confidence:.2f}"
@@ -1177,46 +1204,47 @@ class PoseDetector:
                                 cv2.circle(frame, (wx, wy), 15, outer_color, 3)
                                 cv2.circle(frame, (wx, wy), 8, inner_color, -1)
 
-                # 绘制手腕轨迹线（左右手各一条）
-                cam_trails = self._gesture_trails.get(camera_id, {})
-                for side in ["left", "right"]:
-                    trail_key = f"{person.track_id}_{side}"
-                    trail = cam_trails.get(trail_key)
-                    if trail and len(trail) >= 2:
-                        trail_color = {
-                            "waving": (0, 0, 255),
-                            "hailing": (0, 0, 255),
-                            "greeting": (0, 0, 255),
-                            "hand_up": (0, 255, 255),
-                        }.get(person.gesture, (0, 200, 200))
-                        # 直接使用每帧预存的 pixel_pos，避免用最新标架反投影历史点导致的姿态错位
-                        pixel_pts = []
-                        for tf in trail:
-                            if tf.pixel_pos is not None:
-                                pixel_pts.append(tf.pixel_pos)
-                        # 连续性保护：相邻点距离过大时断线
-                        if len(pixel_pts) >= 2:
-                            ref = trail[-1]
-                            segments = []
-                            current_seg = [pixel_pts[0]]
-                            for i in range(1, len(pixel_pts)):
-                                dx = pixel_pts[i][0] - pixel_pts[i-1][0]
-                                dy = pixel_pts[i][1] - pixel_pts[i-1][1]
-                                if (dx*dx + dy*dy) ** 0.5 > 2.5 * ref.torso_scale:
-                                    # 断线
-                                    if len(current_seg) >= 2:
-                                        segments.append(current_seg)
-                                    current_seg = [pixel_pts[i]]
-                                else:
-                                    current_seg.append(pixel_pts[i])
-                            if len(current_seg) >= 2:
-                                segments.append(current_seg)
-                            for seg in segments:
-                                pts = np.array(seg, np.int32)
-                                cv2.polylines(frame, [pts], False, trail_color, 4)
-                                # 加粗轨迹：在轨迹点周围绘制小圆点增强可见性
-                                for p in seg:
-                                    cv2.circle(frame, (int(p[0]), int(p[1])), 3, trail_color, -1)
+                # 绘制手腕轨迹线（仅非 MiniCPM 引擎需要，MiniCPM 基于视频内容理解无需轨迹）
+                if self._recognizer_mode != "simple-minicpm":
+                    cam_trails = self._gesture_trails.get(camera_id, {})
+                    for side in ["left", "right"]:
+                        trail_key = f"{person.track_id}_{side}"
+                        trail = cam_trails.get(trail_key)
+                        if trail and len(trail) >= 2:
+                            trail_color = {
+                                "waving": (0, 0, 255),
+                                "hailing": (0, 0, 255),
+                                "greeting": (0, 0, 255),
+                                "hand_up": (0, 255, 255),
+                            }.get(person.gesture, (0, 200, 200))
+                            # 直接使用每帧预存的 pixel_pos，避免用最新标架反投影历史点导致的姿态错位
+                            pixel_pts = []
+                            for tf in trail:
+                                if tf.pixel_pos is not None:
+                                    pixel_pts.append(tf.pixel_pos)
+                            # 连续性保护：相邻点距离过大时断线
+                            if len(pixel_pts) >= 2:
+                                ref = trail[-1]
+                                segments = []
+                                current_seg = [pixel_pts[0]]
+                                for i in range(1, len(pixel_pts)):
+                                    dx = pixel_pts[i][0] - pixel_pts[i-1][0]
+                                    dy = pixel_pts[i][1] - pixel_pts[i-1][1]
+                                    if (dx*dx + dy*dy) ** 0.5 > 2.5 * ref.torso_scale:
+                                        # 断线
+                                        if len(current_seg) >= 2:
+                                            segments.append(current_seg)
+                                        current_seg = [pixel_pts[i]]
+                                    else:
+                                        current_seg.append(pixel_pts[i])
+                                if len(current_seg) >= 2:
+                                    segments.append(current_seg)
+                                for seg in segments:
+                                    pts = np.array(seg, np.int32)
+                                    cv2.polylines(frame, [pts], False, trail_color, 4)
+                                    # 加粗轨迹：在轨迹点周围绘制小圆点增强可见性
+                                    for p in seg:
+                                        cv2.circle(frame, (int(p[0]), int(p[1])), 3, trail_color, -1)
 
         return frame
 

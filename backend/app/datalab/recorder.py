@@ -205,6 +205,10 @@ class GestureRecorder:
         persons = getattr(detection_result, "persons", [])
         if persons:
             person = persons[0]  # 录制时通常聚焦单个人
+            # bbox from YOLO detection (x1, y1, x2, y2)
+            bbox = getattr(person, "bbox", None)
+            if bbox is not None and isinstance(bbox, np.ndarray):
+                bbox = bbox.tolist()
             keypoints_data = {
                 "frame_idx": frame_idx,
                 "timestamp": timestamp,
@@ -212,6 +216,7 @@ class GestureRecorder:
                 "keypoints": person.keypoints.tolist()
                 if isinstance(getattr(person, "keypoints", None), np.ndarray)
                 else getattr(person, "keypoints", []),
+                "bbox": bbox,
                 "left_hand_landmarks": getattr(person, "left_hand_landmarks", None),
                 "right_hand_landmarks": getattr(person, "right_hand_landmarks", None),
                 "left_palm_normal": person.left_palm_normal.tolist()

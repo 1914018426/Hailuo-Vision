@@ -484,6 +484,10 @@ async def camera_push_task(camera_id: str) -> None:
                 for person in detection_result.persons
             ]
 
+            # DEBUG: 打印发送的 gesture 值
+            for d in detections_data:
+                logger.info("WS send gesture=%s conf=%.2f", d["gesture"], d["gesture_conf"])
+
             header = {
                 "type": "frame",
                 "camera_id": camera_id,

@@ -160,6 +160,7 @@ class EngineStats(BaseModel):
     positive_segments: int = Field(default=0, description="连续 waving 片段数")
     false_positive_estimate: float = Field(default=0.0, description="估算误检率（基于共识基线）")
     noise_rejection_rate: float = Field(default=0.0, description="低速度场景拒绝率（velocity < 0.03）")
+    inference_count: int = Field(default=0, description="MiniCPM 推理次数（Simple 引擎为 0）")
 
 
 class AgreementMatrix(BaseModel):
@@ -171,17 +172,14 @@ class AgreementMatrix(BaseModel):
     )
 
 
-class SimpleTransformerHybridAdvantage(BaseModel):
-    """SimpleTransformerHybrid 优势分析。"""
+class SimpleMiniCPMHybridAdvantage(BaseModel):
+    """Simple+MiniCPM 混合引擎优势分析。"""
 
     vs_simple_precision_gain: float = Field(
         default=0.0, description="相比 Simple 的精度增益（百分比）"
     )
-    vs_transformer_recall_gain: float = Field(
-        default=0.0, description="相比 Transformer 的召回增益（百分比）"
-    )
-    soft_filter_rescue_rate: float = Field(
-        default=0.0, description="soft-filter 挽救率（tf确认但simple拒绝的高置信场景）"
+    vs_minicpm_recall_gain: float = Field(
+        default=0.0, description="相比 MiniCPM 的召回增益（百分比）"
     )
     noise_rejection_score: float = Field(
         default=0.0, description="静止场景误检率（越低越好，此处为相对优势分）"
@@ -257,8 +255,8 @@ class AnalysisReport(BaseModel):
     consensus_baseline_frames: int = Field(
         default=0, description="3/5 引擎共识基线 waving 帧数"
     )
-    simple_transformer_advantage: SimpleTransformerHybridAdvantage = Field(
-        default_factory=SimpleTransformerHybridAdvantage
+    simple_minicpm_advantage: SimpleMiniCPMHybridAdvantage = Field(
+        default_factory=SimpleMiniCPMHybridAdvantage
     )
     # 新增：科学指标
     precision_recall_f1: Dict[str, Dict[str, float]] = Field(

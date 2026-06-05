@@ -1,7 +1,6 @@
 import { memo } from 'react';
 import { Video, Users } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { GestureOverlay } from './GestureOverlay';
 import { GESTURE_LABELS } from '@/types';
 import type { DetectionResult, Gesture } from '@/types';
 
@@ -18,6 +17,8 @@ function getGestureColor(gesture: Gesture): string {
       return 'text-slate-400 bg-slate-400/15 border-slate-400/30';
     case 'waving':
       return 'text-red-400 bg-red-400/15 border-red-400/30';
+    case 'checking':
+      return 'text-orange-400 bg-orange-400/15 border-orange-400/30';
     default:
       return 'text-slate-500 bg-slate-500/10 border-slate-500/20';
   }
@@ -37,6 +38,8 @@ export const VideoPanel = memo(function VideoPanel({ label, frameImage, detectio
         return 'border-red-500/60 shadow-glow-red animate-border-pulse';
       case 'hand_up':
         return 'border-slate-500/60 shadow-glow-slate animate-border-pulse';
+      case 'checking':
+        return 'border-orange-500/60 shadow-glow-orange animate-border-pulse';
       default:
         return 'border-slate-800/80 hover:border-slate-700/80';
     }
@@ -89,23 +92,19 @@ export const VideoPanel = memo(function VideoPanel({ label, frameImage, detectio
           </div>
         )}
 
-        {/* Gesture Overlay */}
-        {frameImage && (
-          <GestureOverlay detection={detection} />
-        )}
       </div>
 
       {/* Bottom Info Bar */}
       <div className="flex items-center justify-between px-3 py-2 bg-slate-900/95 border-t border-slate-800/60">
-        {/* Gesture Label */}
+        {/* Gesture Label — min-w 固定避免 none/checking 切换时抖动 */}
         <div
           className={cn(
-            'flex items-center gap-2 px-2.5 py-1 rounded-full border transition-all duration-300',
+            'flex items-center justify-center gap-2 px-2.5 py-1 rounded-full border transition-all duration-300 min-w-[64px]',
             getGestureColor(detection.best_gesture)
           )}
         >
-          <span className="text-[11px] font-medium">
-            {GESTURE_LABELS[detection.best_gesture]}
+          <span className="text-[11px] font-medium whitespace-nowrap">
+            {GESTURE_LABELS[detection.best_gesture] ?? '检测中'}
           </span>
         </div>
 

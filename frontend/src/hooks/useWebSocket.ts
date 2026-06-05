@@ -134,7 +134,7 @@ export function useWebSocket(): UseWebSocketReturn {
         inference_ms?: number;
         detections?: Array<{
           bbox?: [number, number, number, number];
-          gesture?: 'waving' | 'hand_up' | 'none';
+          gesture?: 'waving' | 'hand_up' | 'checking' | 'none';
           gesture_conf?: number;
           confidence?: number;
         }>;
@@ -142,10 +142,10 @@ export function useWebSocket(): UseWebSocketReturn {
       }) => {
         if (!raw.camera_id) return;
         const dets = Array.isArray(raw.detections) ? raw.detections : [];
-        let bestGesture: 'waving' | 'hand_up' | 'none' = 'none';
+        let bestGesture: 'waving' | 'hand_up' | 'checking' | 'none' = 'none';
         let bestGestureConf = 0;
         const personDetections = dets.map((d) => {
-          const g = (d.gesture ?? 'none') as 'waving' | 'hand_up' | 'none';
+          const g = (d.gesture ?? 'none') as 'waving' | 'hand_up' | 'checking' | 'none';
           const gc = d.gesture_conf ?? 0;
           if (g !== 'none' && gc > bestGestureConf) {
             bestGesture = g;

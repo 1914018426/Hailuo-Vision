@@ -96,6 +96,7 @@ export default {
         'glow-lg': '0 0 30px rgba(45, 212, 191, 0.4)',
         'glow-red': '0 0 15px rgba(239, 68, 68, 0.3)',
         'glow-slate': '0 0 15px rgba(148, 163, 184, 0.3)',
+        'glow-orange': '0 0 15px rgba(249, 115, 22, 0.3)',
       },
     },
   },

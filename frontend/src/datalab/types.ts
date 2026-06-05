@@ -42,6 +42,7 @@ export interface EngineStats {
   positive_segments: number;
   false_positive_estimate: number;
   noise_rejection_rate: number;
+  inference_count: number;
 }
 
 export interface AgreementMatrix {
@@ -49,10 +50,9 @@ export interface AgreementMatrix {
   matrix: Record<string, Record<string, number>>;
 }
 
-export interface SimpleTransformerHybridAdvantage {
+export interface SimpleMiniCPMHybridAdvantage {
   vs_simple_precision_gain: number;
-  vs_transformer_recall_gain: number;
-  soft_filter_rescue_rate: number;
+  vs_minicpm_recall_gain: number;
   noise_rejection_score: number;
   latency_efficiency_gain: number;
   overall_score: number;
@@ -119,7 +119,7 @@ export interface AnalysisReport {
   engine_stats: EngineStats[];
   agreement_matrix: AgreementMatrix;
   consensus_baseline_frames: number;
-  simple_transformer_advantage: SimpleTransformerHybridAdvantage;
+  simple_minicpm_advantage: SimpleMiniCPMHybridAdvantage;
   precision_recall_f1: Record<string, { precision: number; recall: number; f1: number }>;
   pr_curve: PRCurvePoint[];
   roc_curve: PRCurvePoint[];

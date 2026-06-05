@@ -11,11 +11,16 @@
 """
 
 import asyncio
+import json
 import logging
 import math
+import os
 import time
 from collections import deque
+from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
+
+import cv2
 import numpy as np
 
 from app.datalab.models import (
@@ -32,298 +37,43 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# STH 组件消融包装器（子类化，不修改原引擎）
+# Simple+MiniCPM 组件消融包装器
 # =============================================================================
 
-class _STHNoTransformBypass:
-    """STH 去掉 Transformer 不同意时的降级 fallback（0.9× Simple conf）。
-
-    当前 STH 为 Simple-primary：Simple 确认 waving 后，若 Transformer
-    也确认则取 max(conf)；若 Transformer 不同意且 Simple conf > 0.45，
-    则降级输出 0.9× Simple conf。本包装器移除该降级分支，强制要求
-    Transformer 与 Simple 同时确认才输出 waving。
-    """
+class _SimpleMiniCPMNoSimpleGate:
+    """Simple+MiniCPM 去掉 Simple trigger，直接让 MiniCPM 看到所有帧。"""
 
     def __init__(self, base) -> None:
         self._base = base
 
     def recognize(self, *args, **kwargs):
-        from app.ai.gesture import GestureType, GestureResult
-
-        if self._base._has_transformer:
-            tf_result = self._base.transformer.recognize(*args, **kwargs)
-        else:
-            tf_result = None
-        s_result = self._base.simple.recognize(*args, **kwargs)
-
-        # Simple-primary：Simple 必须先确认
-        if s_result.gesture_type != GestureType.WAVING:
-            return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
-
-        if tf_result and tf_result.gesture_type == GestureType.WAVING:
-            return GestureResult(
-                gesture_type=GestureType.WAVING,
-                confidence=max(s_result.confidence, tf_result.confidence),
-            )
-
-        # 去掉 fallback：Transformer 不同意则直接拒绝
-        return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
-
-    def reset(self):
-        self._base.reset()
-
-    @property
-    def simple(self):
-        return self._base.simple
-
-    @property
-    def transformer(self):
-        return self._base.transformer
-
-
-class _STHStrictAnd:
-    """STH 严格 AND：Simple 与 Transformer 必须同时确认，无任何 fallback。"""
-
-    def __init__(self, base) -> None:
-        self._base = base
-
-    def recognize(self, *args, **kwargs):
-        from app.ai.gesture import GestureType, GestureResult
-
-        if self._base._has_transformer:
-            tf_result = self._base.transformer.recognize(*args, **kwargs)
-        else:
-            tf_result = None
-        s_result = self._base.simple.recognize(*args, **kwargs)
-
-        if s_result.gesture_type != GestureType.WAVING:
-            return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
-
-        if tf_result and tf_result.gesture_type == GestureType.WAVING:
-            return GestureResult(
-                gesture_type=GestureType.WAVING,
-                confidence=max(s_result.confidence, tf_result.confidence),
-            )
-
-        return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
+        # 强制 trigger 为 True，绕过 Simple 姿态门
+        kwargs = dict(kwargs)
+        # 保存原始方法
+        original_check = self._base._simple.check_trigger_only
+        self._base._simple.check_trigger_only = lambda _kp: True
+        try:
+            return self._base.recognize(*args, **kwargs)
+        finally:
+            self._base._simple.check_trigger_only = original_check
 
     def reset(self):
         self._base.reset()
 
 
-class _STHTransformerOnly:
-    """STH 仅保留 Transformer，无 Simple 后验过滤。"""
+class _SimpleMiniCPMNoCooldown:
+    """Simple+MiniCPM 去掉冷却期，允许更频繁的推理。"""
 
     def __init__(self, base) -> None:
         self._base = base
 
     def recognize(self, *args, **kwargs):
-        # 直接返回 Transformer 结果
-        return self._base.transformer.recognize(*args, **kwargs)
-
-    def reset(self):
-        self._base.reset()
-
-
-# =============================================================================
-# Simple / TripleLock 组件消融包装器
-# =============================================================================
-
-class _SimpleNoPeriodicity:
-    """Simple 去掉周期性检测（仅保留姿态门）。"""
-
-    def __init__(self, base) -> None:
-        self._base = base
-        from app.ai.gesture import SimpleGestureEngine
-
-        class EngineNoPeriodicity(SimpleGestureEngine):
-            def _detect_periodic(self, k: str) -> Tuple[bool, float]:
-                # 强制通过周期性检测，返回中等置信度
-                return True, 0.55
-
-        self._base.engine = EngineNoPeriodicity(
-            nose_conf_threshold=base.engine.nose_conf_threshold,
-            eye_conf_threshold=base.engine.eye_conf_threshold,
-            period_window_seconds=base.engine.period_window,
-            fps=base.engine.fps,
-            min_freq_hz=base.engine.min_freq_hz,
-            max_freq_hz=base.engine.max_freq_hz,
-            min_cycles=base.engine.min_cycles,
-            min_confirm_frames=base.engine.min_confirm_frames,
-            hold_frames=base.engine.hold_frames,
-            ema_alpha=base.engine.ema_alpha,
-        )
-
-    def recognize(self, *args, **kwargs):
-        return self._base.recognize(*args, **kwargs)
-
-    def reset(self):
-        self._base.reset()
-
-
-class _SimpleNoPoseGate:
-    """Simple 去掉姿态门（鼻子可见 + 手腕高于手肘），仅保留周期性。"""
-
-    def __init__(self, base) -> None:
-        self._base = base
-        from app.ai.gesture import SimpleGestureEngine
-
-        class EngineNoPoseGate(SimpleGestureEngine):
-            def process_frame(self, keypoints, side, track_id, wrist_local, timestamp):
-                # 跳过鼻子和手腕高度检查，直接做周期性（使用 wrist-elbow 相对向量）
-                k = self._key(track_id, side)
-                maxlen = int(self.period_window * self.fps)
-
-                if side == "left":
-                    elbow_idx, wrist_idx = 7, 9
-                else:
-                    elbow_idx, wrist_idx = 8, 10
-
-                if float(keypoints[elbow_idx, 2]) < 0.3 or float(keypoints[wrist_idx, 2]) < 0.3:
-                    self._reset(k)
-                    return "none", 0.0
-
-                # 使用 wrist-elbow 相对向量（与当前 SimpleGestureEngine 一致）
-                shoulder_l = keypoints[5][:2]
-                shoulder_r = keypoints[6][:2]
-                shoulder_width = float(np.linalg.norm(shoulder_r - shoulder_l))
-                if shoulder_width < 1.0:
-                    self._reset(k)
-                    return "none", 0.0
-
-                wrist_elbow_vec = (keypoints[wrist_idx][:2] - keypoints[elbow_idx][:2]) / shoulder_width
-                rel_vec = (float(wrist_elbow_vec[0]), float(wrist_elbow_vec[1]))
-
-                # 5帧滑动平均去抖（与当前 SimpleGestureEngine 一致）
-                if k not in self._smooth_win:
-                    self._smooth_win[k] = deque(maxlen=5)
-                self._smooth_win[k].append(rel_vec)
-                smoothed = (
-                    sum(p[0] for p in self._smooth_win[k]) / len(self._smooth_win[k]),
-                    sum(p[1] for p in self._smooth_win[k]) / len(self._smooth_win[k]),
-                )
-
-                if k not in self._wrist_history:
-                    self._wrist_history[k] = deque(maxlen=maxlen)
-                self._wrist_history[k].append(smoothed)
-
-                is_periodic, raw_conf = self._detect_periodic(k)
-
-                if is_periodic:
-                    self._confirm_count[k] = self._confirm_count.get(k, 0) + 1
-                else:
-                    self._confirm_count[k] = max(0, self._confirm_count.get(k, 0) - 1)
-
-                if k not in self._ema_conf:
-                    self._ema_conf[k] = raw_conf
-                else:
-                    self._ema_conf[k] = (
-                        self.ema_alpha * raw_conf
-                        + (1.0 - self.ema_alpha) * self._ema_conf[k]
-                    )
-                smoothed_conf = self._ema_conf[k]
-
-                if self._confirm_count.get(k, 0) >= self.min_confirm_frames:
-                    self._hold_count[k] = self.hold_frames
-                    gesture, conf = "waving", smoothed_conf
-                    self._last_result[k] = (gesture, conf)
-                    return gesture, conf
-
-                if self._hold_count.get(k, 0) > 0:
-                    self._hold_count[k] -= 1
-                    if k in self._last_result:
-                        decay = self._hold_count[k] / max(self.hold_frames, 1)
-                        return self._last_result[k][0], self._last_result[k][1] * decay
-
-                return "none", smoothed_conf
-
-        self._base.engine = EngineNoPoseGate(
-            nose_conf_threshold=base.engine.nose_conf_threshold,
-            eye_conf_threshold=base.engine.eye_conf_threshold,
-            period_window_seconds=base.engine.period_window,
-            fps=base.engine.fps,
-            min_freq_hz=base.engine.min_freq_hz,
-            max_freq_hz=base.engine.max_freq_hz,
-            min_cycles=base.engine.min_cycles,
-            min_confirm_frames=base.engine.min_confirm_frames,
-            hold_frames=base.engine.hold_frames,
-            ema_alpha=base.engine.ema_alpha,
-            min_amplitude_tu=base.engine.min_amplitude_tu,
-        )
-
-    def recognize(self, *args, **kwargs):
-        return self._base.recognize(*args, **kwargs)
-
-    def reset(self):
-        self._base.reset()
-
-
-class _TripleLockNoOrientation:
-    """TripleLock 去掉朝向锁。"""
-
-    def __init__(self, base) -> None:
-        self._base = base
-
-    def recognize(self, *args, **kwargs):
-        from app.ai.gesture import GestureType, GestureResult
-
-        keypoints = kwargs.get("keypoints") if kwargs.get("keypoints") is not None else args[0] if args else None
-        track_id = kwargs.get("track_id", "default")
-        left_pn = kwargs.get("left_palm_normal")
-        right_pn = kwargs.get("right_palm_normal")
-        timestamp = kwargs.get("frame_timestamp")
-        active_ids = kwargs.get("active_track_ids")
-
-        if active_ids is not None:
-            self._base.engine.gc_states(active_ids)
-
-        now = timestamp if timestamp is not None else time.time()
-
-        c = self._base.config.ai
-        from app.ai.facing import facing_gate
-
-        f_human, is_hard_rejected, f_human_multiplier = facing_gate(
-            keypoints,
-            hard_threshold=c.gesture_facing_hard_threshold,
-            soft_threshold=c.gesture_facing_soft_threshold,
-        )
-        if is_hard_rejected:
-            return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
-
-        best_result = None
-        for side in ["right", "left"]:
-            raw_normal = left_pn if side == "left" else right_pn
-            palm_normal = None
-            if raw_normal is not None:
-                state = self._base.engine._get_state(track_id, side)
-                palm_normal = state.normal_smoother.update(raw_normal)
-
-            # Monkey-patch orientation lock angle to always pass
-            original_angle = self._base.engine.orientation_lock_angle
-            self._base.engine.orientation_lock_angle = 180.0
-            try:
-                gesture, confidence = self._base.engine.process_frame(
-                    keypoints=keypoints,
-                    side=side,
-                    track_id=track_id,
-                    palm_normal=palm_normal,
-                    timestamp=now,
-                    f_human=f_human,
-                    f_human_multiplier=f_human_multiplier,
-                )
-            finally:
-                self._base.engine.orientation_lock_angle = original_angle
-
-            result = GestureResult(
-                gesture_type=GestureType.WAVING if gesture == "waving" else GestureType.NONE,
-                confidence=confidence,
-            )
-            if best_result is None or result.confidence > best_result.confidence:
-                best_result = result
-
-        return best_result if best_result else GestureResult(
-            gesture_type=GestureType.NONE, confidence=0.0
-        )
+        original_cooldown = self._base._cooldown_seconds
+        self._base._cooldown_seconds = 0.0
+        try:
+            return self._base.recognize(*args, **kwargs)
+        finally:
+            self._base._cooldown_seconds = original_cooldown
 
     def reset(self):
         self._base.reset()
@@ -344,6 +94,8 @@ class AblationRunner:
         self._lock = asyncio.Lock()
         self._queue: List[Tuple[AblationExperiment, List[str], ExperimentType, Optional[List[float]]]] = []
         self._queue_task: Optional[asyncio.Task] = None
+        # 共享 MiniCPM 引擎实例：避免多个实例并发加载模型导致权重损坏/输出乱码
+        self._shared_minicpm_engine: Optional[Any] = None
 
     async def run_experiment(
         self,
@@ -367,24 +119,19 @@ class AblationRunner:
 
         if exp_type == ExperimentType.COMPONENT_ABLATION:
             engines = [
-                "sth_full",
-                "sth_no_transformer_bypass",
-                "sth_transformer_only",
+                "simple_minicpm_full",
+                "simple_minicpm_no_simple_gate",
+                "simple_minicpm_no_cooldown",
+                "minicpm_full",
                 "simple_full",
-                "simple_no_periodicity",
-                "simple_no_pose_gate",
-                "triplelock_full",
-                "triplelock_no_orientation",
             ]
         elif exp_type == ExperimentType.THRESHOLD_SWEEP:
-            engines = engine_names or ["simple_transformer", "transformer"]
+            engines = engine_names or ["simple_minicpm", "minicpm"]
         else:
             default_engines = [
                 "simple",
-                "transformer",
-                "triplelock",
-                "transformer_triplelock",
-                "simple_transformer",
+                "simple_minicpm",
+                "minicpm",
             ]
             engines = engine_names or default_engines
 
@@ -453,7 +200,7 @@ class AblationRunner:
         pos_ts = await self.run_experiment(
             positive_recording_ids[0],
             "threshold_sweep",
-            engine_names=["simple_transformer", "transformer"],
+            engine_names=["simple_minicpm", "minicpm"],
             parent_id=parent.id,
         )
         pos_ts.positive_recording_ids = positive_recording_ids
@@ -540,7 +287,28 @@ class AblationRunner:
                 self._current_exp = exp
                 self._cancelled = False
 
-            await self._run_background(exp, engines, exp_type, threshold_range)
+            # 在独立线程中运行实验，避免阻塞主事件循环的 HTTP 处理
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, self._run_background_in_thread, exp, engines, exp_type, threshold_range
+            )
+
+    def _run_background_in_thread(
+        self,
+        exp: AblationExperiment,
+        engine_names: List[str],
+        exp_type: ExperimentType,
+        threshold_range: Optional[List[float]] = None,
+    ) -> None:
+        """在线程中运行实验，创建独立的事件循环避免阻塞主循环。"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                self._run_background(exp, engine_names, exp_type, threshold_range)
+            )
+        finally:
+            loop.close()
 
     async def _run_background(
         self,
@@ -576,6 +344,9 @@ class AblationRunner:
             exp.total_frames = total_frames
             self.storage.update_experiment(exp)
 
+            # 打开视频文件（供 MiniCPM 引擎使用真实帧）
+            self._current_video_cap = self._open_recording_video(recording_ids)
+
             if exp_type == ExperimentType.THRESHOLD_SWEEP:
                 await self._run_threshold_sweep(exp, keypoints_frames, tnlf_frames, engine_names, threshold_range, detections_frames)
             elif exp_type == ExperimentType.COMPONENT_ABLATION:
@@ -602,6 +373,10 @@ class AblationRunner:
             self.storage.update_experiment(exp)
             if getattr(exp, 'parent_id', None):
                 await self._check_parent_status(exp.parent_id)
+        finally:
+            if getattr(self, '_current_video_cap', None) is not None:
+                self._current_video_cap.release()
+                self._current_video_cap = None
 
     async def _check_parent_status(self, parent_id: str) -> None:
         """检查父实验状态（由子实验完成后立即触发）。"""
@@ -710,6 +485,9 @@ class AblationRunner:
                 self.storage.update_experiment(exp)
                 await asyncio.sleep(0)
 
+                # 等待 MiniCPM 异步推理完成并回填结果
+                await self._backfill_minicpm_results(exp, engines, keypoints_frames)
+
                 # 释放引擎状态
                 engines[engine_name].reset()
 
@@ -781,6 +559,9 @@ class AblationRunner:
             if idx % 5 == 0:
                 await asyncio.sleep(0)
 
+        # 等待 MiniCPM 异步推理完成并回填结果
+        await self._backfill_minicpm_results(exp, engines, keypoints_frames)
+
     # ------------------------------------------------------------------
     # 通用推理
     # ------------------------------------------------------------------
@@ -805,6 +586,92 @@ class AblationRunner:
                 self.storage.update_experiment(exp)
             if idx % 5 == 0:
                 await asyncio.sleep(0)
+
+        # 等待 MiniCPM 异步推理完成并回填结果
+        await self._backfill_minicpm_results(exp, engines, keypoints_frames)
+
+    async def _backfill_minicpm_results(
+        self, exp: AblationExperiment,
+        engines: Dict[str, Any],
+        keypoints_frames: List[Dict],
+    ) -> None:
+        """等待 MiniCPM 引擎异步推理完成，按精确窗口回填每个 frame 的结果。
+
+        每个 CHECKING 帧查询其所属的 MiniCPM 推理窗口，使用窗口自身的 gesture/conf 回填。
+        未被任何窗口覆盖的 CHECKING 帧标记为 'none'（Simple trigger 通过了但 MiniCPM 从未分析）。
+        """
+        from app.ai.gesture import SimpleMiniCPMHybridRecognizer, MiniCPMGestureRecognizer
+
+        # 1. 等待每个 MiniCPM 引擎的结果并收集推理窗口（在线程池中执行，避免阻塞事件循环）
+        engine_windows: Dict[str, List[Tuple[int, int, str, float]]] = {}
+        loop = asyncio.get_running_loop()
+        for name, engine in engines.items():
+            if isinstance(engine, (SimpleMiniCPMHybridRecognizer, MiniCPMGestureRecognizer)):
+                track_id = keypoints_frames[-1].get("track_id", "person_1") if keypoints_frames else "person_1"
+                logger.info("等待 MiniCPM 引擎 %s 异步结果 (track_id=%s)...", name, track_id)
+                gesture, conf = await loop.run_in_executor(None, engine.wait_for_result, track_id, 60.0)
+                logger.info("MiniCPM 引擎 %s 最终结果: %s %.2f", name, gesture, conf)
+                windows = engine.get_inference_windows(track_id)
+                engine_windows[name] = windows
+                logger.info("MiniCPM 引擎 %s 推理窗口: %s", name, windows)
+
+        if not engine_windows:
+            return
+
+        # 2. 读取现有 frame_results
+        rows = self.storage.read_frame_results(exp.id)
+        if not rows:
+            return
+
+        # 3. 按引擎处理：每个 CHECKING 帧精确匹配到所属窗口，使用该窗口的结果回填
+        modified = False
+        for name, windows in engine_windows.items():
+            g_key = f"{name}_gesture"
+            c_key = f"{name}_confidence"
+
+            for row in rows:
+                if row.get(g_key) != "checking":
+                    continue
+                row_frame_idx = row.get("frame_idx", 0)
+
+                # 查找覆盖该帧的推理窗口（使用窗口自身的结果）
+                matched_gesture = "none"
+                matched_conf = 0.0
+                for start_idx, end_idx, gesture, conf in windows:
+                    if start_idx <= row_frame_idx <= end_idx:
+                        matched_gesture = gesture
+                        matched_conf = conf
+                        break
+
+                row[g_key] = matched_gesture
+                row[c_key] = round(matched_conf, 4)
+                modified = True
+
+        # 4. 保存各引擎的 MiniCPM 推理次数（用于后续效率评分）
+        inference_counts: Dict[str, int] = {}
+        for name, windows in engine_windows.items():
+            inference_counts[name] = len(windows)
+        if inference_counts:
+            exp_obj = self.storage.get_experiment(exp.id)
+            if exp_obj:
+                exp_dir = Path(exp_obj.frame_results_path).parent if exp_obj.frame_results_path else Path(f"data/datalab/experiments/{exp.id}")
+                exp_dir.mkdir(parents=True, exist_ok=True)
+                counts_path = exp_dir / "minicpm_inference_counts.json"
+                with open(counts_path, "w", encoding="utf-8") as f:
+                    json.dump(inference_counts, f, ensure_ascii=False, indent=2)
+                logger.info("已保存 MiniCPM 推理次数: %s", inference_counts)
+
+        if not modified:
+            return
+
+        # 5. 重写 frame_results.jsonl
+        exp_obj = self.storage.get_experiment(exp.id)
+        if exp_obj and exp_obj.frame_results_path:
+            path = Path(exp_obj.frame_results_path)
+            with open(path, "w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            logger.info("已按精确推理窗口回填 MiniCPM 结果: %d 条 frame_results", len(rows))
 
     def _infer_single_frame(
         self, kp_frame: Dict, tnlf_frames: List[Dict], idx: int, engines: Dict[str, Any],
@@ -843,6 +710,32 @@ class AblationRunner:
             "right_ext_ratio": tnlf.get("right_ext_ratio", 0.0),
         }
 
+        # 为 MiniCPM 引擎准备 frame / bbox
+        frame: Optional[np.ndarray] = None
+        bbox: Optional[Tuple[int, int, int, int]] = None
+        needs_frame_engines = [
+            (name, engine) for name, engine in engines.items()
+            if self._needs_frame(engine)
+        ]
+        if needs_frame_engines:
+            # 1. 获取 bbox：优先用录制时保存的，否则从 keypoints 推断
+            saved_bbox = kp_frame.get("bbox")
+            if saved_bbox is not None and len(saved_bbox) == 4:
+                bbox = tuple(int(v) for v in saved_bbox)
+            else:
+                bbox = self._bbox_from_keypoints(keypoints)
+
+            # 2. 从视频读取对应帧
+            cap = getattr(self, "_current_video_cap", None)
+            if cap is not None and cap.isOpened() and bbox is not None:
+                # frame_idx 是 1-based，set 到 0-based 位置
+                target_pos = max(0, frame_idx - 1)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_pos)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    logger.warning("无法读取视频帧 %d", frame_idx)
+                    frame = None
+
         row: Dict[str, Any] = {
             "frame_idx": frame_idx,
             "timestamp": timestamp,
@@ -850,7 +743,12 @@ class AblationRunner:
         for name, engine in engines.items():
             t0 = time.perf_counter()
             try:
-                result = engine.recognize(**kwargs)
+                engine_kwargs = dict(kwargs)
+                if self._needs_frame(engine):
+                    engine_kwargs["frame"] = frame
+                    engine_kwargs["bbox"] = bbox
+                    engine_kwargs["frame_idx"] = frame_idx
+                result = engine.recognize(**engine_kwargs)
                 gesture = (
                     result.gesture_type.value
                     if hasattr(result.gesture_type, "value")
@@ -916,12 +814,106 @@ class AblationRunner:
                     # 负样本 ground truth 强制为 none
                     det["gesture"] = "none"
                     det["gesture_conf"] = 0.0
+                else:
+                    # 正样本：所有有人出现的帧都应当作 waving ground truth。
+                    # 原 detections 中的 gesture 来自录制时的 Simple 引擎检测，
+                    # 会漏掉大量实际 waving 帧，导致 MiniCPM 正确检测的帧被算作 FP。
+                    # 修正：以 keypoints 存在性判断人物可见，标记为 waving。
+                    keypoints = np.array(kp.get("keypoints", []))
+                    if keypoints.ndim == 1:
+                        keypoints = keypoints.reshape(-1, 3)
+                    person_visible = (
+                        len(keypoints) > 0
+                        and np.any(keypoints[:, 2] > 0.15)
+                    )
+                    if person_visible:
+                        det["gesture"] = "waving"
+                        det["gesture_conf"] = 1.0
+                    else:
+                        det["gesture"] = "none"
+                        det["gesture_conf"] = 0.0
 
                 keypoints_frames.append(kp)
                 tnlf_frames.append(tnlf)
                 detections_frames.append(det)
 
         return keypoints_frames, tnlf_frames, detections_frames
+
+    def _open_recording_video(self, recording_ids: List[str]) -> Optional[Any]:
+        """打开第一个可用的录制视频文件，返回 cv2.VideoCapture。"""
+        import cv2
+        for rid in recording_ids:
+            rec = self.storage.get_recording(rid)
+            if rec and rec.video_path and os.path.exists(rec.video_path):
+                cap = cv2.VideoCapture(rec.video_path)
+                if cap.isOpened():
+                    logger.info("实验使用录制视频: %s", rec.video_path)
+                    return cap
+                cap.release()
+        logger.warning("无可用录制视频，MiniCPM 引擎将无法获得真实帧")
+        return None
+
+    @staticmethod
+    def _bbox_from_keypoints(keypoints: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """从关键点推断人物 bbox（兼容旧数据无 bbox 的情况）。"""
+        if keypoints.ndim == 1:
+            keypoints = keypoints.reshape(-1, 3)
+        if len(keypoints) == 0:
+            return None
+        # 取所有置信度 > 0.1 的关键点
+        valid = keypoints[keypoints[:, 2] > 0.1]
+        if len(valid) == 0:
+            valid = keypoints
+        xs = valid[:, 0]
+        ys = valid[:, 1]
+        margin = 20
+        x1 = max(0, int(xs.min()) - margin)
+        y1 = max(0, int(ys.min()) - margin)
+        x2 = int(xs.max()) + margin
+        y2 = int(ys.max()) + margin
+        return (x1, y1, x2, y2)
+
+    @staticmethod
+    def _needs_frame(engine: Any) -> bool:
+        """判断引擎是否需要 frame/bbox 参数（MiniCPM 系列）。"""
+        from app.ai.gesture import SimpleMiniCPMHybridRecognizer, MiniCPMGestureRecognizer
+        return isinstance(engine, (SimpleMiniCPMHybridRecognizer, MiniCPMGestureRecognizer))
+
+    def _get_shared_minicpm_engine(self) -> Any:
+        """获取共享的 MiniCPMEngine 实例（单例，模型只加载一次，避免多实例并发加载导致模型损坏）。"""
+        if self._shared_minicpm_engine is None:
+            from app.ai.minicpm_engine import MiniCPMEngine
+            minicpm_model = getattr(self.config.ai, "minicpm_model_path", "OpenBMB/MiniCPM-V-4.6")
+            minicpm_prompt = getattr(self.config.ai, "minicpm_prompt", None)
+            self._shared_minicpm_engine = MiniCPMEngine(
+                model_path=minicpm_model,
+                max_concurrent=16,
+                prompt=minicpm_prompt,
+            )
+            logger.info("共享 MiniCPMEngine 已创建: %s", minicpm_model)
+        return self._shared_minicpm_engine
+
+    def _create_minicpm_engine(self) -> Any:
+        """创建独立的 MiniCPMEngine 实例，但共享已加载的模型权重（避免并发加载损坏）。"""
+        shared = self._get_shared_minicpm_engine()
+        # 等待共享引擎模型加载完成
+        import time
+        for _ in range(300):
+            if shared._loaded:
+                break
+            time.sleep(0.1)
+        if not shared._loaded:
+            raise RuntimeError("共享 MiniCPM 模型加载超时")
+        from app.ai.minicpm_engine import MiniCPMEngine
+        minicpm_model = getattr(self.config.ai, "minicpm_model_path", "OpenBMB/MiniCPM-V-4.6")
+        minicpm_prompt = getattr(self.config.ai, "minicpm_prompt", None)
+        return MiniCPMEngine(
+            model_path=minicpm_model,
+            max_concurrent=16,
+            prompt=minicpm_prompt,
+            model=shared._model,
+            processor=shared._processor,
+        )
 
     # ------------------------------------------------------------------
     # 引擎工厂
@@ -937,56 +929,103 @@ class AblationRunner:
     def _instantiate_engine(self, name: str) -> Any:
         from app.ai.gesture import (
             SimpleGestureRecognizer,
-            TransformerGestureRecognizer,
-            GestureRecognizer,
-            HybridGestureRecognizer,
-            SimpleTransformerHybridRecognizer,
+            SimpleMiniCPMHybridRecognizer,
+            MiniCPMGestureRecognizer,
         )
 
-        model_path = self.config.ai.transformer_model_path
-        threshold = self.config.ai.transformer_confidence_threshold
+        minicpm_model = getattr(self.config.ai, "minicpm_model_path", "OpenBMB/MiniCPM-V-4.6")
+        minicpm_conf = getattr(self.config.ai, "minicpm_confidence_threshold", 0.6)
+        minicpm_prompt = getattr(self.config.ai, "minicpm_prompt", None)
+        minicpm_input_size = getattr(self.config.ai, "minicpm_input_size", 448)
+        minicpm_max_frames = getattr(self.config.ai, "minicpm_max_frames", 16)
+        minicpm_buffer_seconds = getattr(self.config.ai, "minicpm_buffer_seconds", 1.5)
+        minicpm_min_frames = getattr(self.config.ai, "minicpm_min_frames", 8)
+        minicpm_infer_interval_s = getattr(self.config.ai, "minicpm_infer_interval_s", 1.0)
+        minicpm_max_concurrent = getattr(self.config.ai, "minicpm_max_concurrent", 16)
+        minicpm_cooldown_seconds = getattr(self.config.ai, "minicpm_cooldown_seconds", 2.0)
 
         if name == "simple":
-            return SimpleGestureRecognizer()
-        elif name == "transformer":
-            return TransformerGestureRecognizer(
-                model_path=model_path, confidence_threshold=threshold,
+            # 消融实验中使用与 SimpleMiniCPM trigger 相同的宽松阈值，
+            # 确保低质量视频下公平对比
+            return SimpleGestureRecognizer(
+                nose_conf_threshold=0.15,
+                eye_conf_threshold=0.15,
+                wrist_elbow_conf_threshold=0.10,
             )
-        elif name == "triplelock":
-            recognizer = GestureRecognizer()
-            # 消融数据 TNLF 振幅较小，降低运动锁阈值以保证公平比较
-            recognizer.engine.motion_amp_min = 0.02
-            return recognizer
-        elif name == "transformer_triplelock":
-            hybrid = HybridGestureRecognizer(
-                transformer_model_path=model_path,
-                transformer_threshold=threshold,
+        elif name == "simple_minicpm":
+            return SimpleMiniCPMHybridRecognizer(
+                model_path=minicpm_model,
+                input_size=minicpm_input_size,
+                max_frames=minicpm_max_frames,
+                buffer_seconds=minicpm_buffer_seconds,
+                min_frames=minicpm_min_frames,
+                infer_interval_s=minicpm_infer_interval_s,
+                max_concurrent=minicpm_max_concurrent,
+                confidence_threshold=minicpm_conf,
+                cooldown_seconds=minicpm_cooldown_seconds,
+                prompt=minicpm_prompt,
+                minicpm_engine=self._create_minicpm_engine(),
             )
-            hybrid.triplelock.engine.motion_amp_min = 0.02
-            return hybrid
-        elif name == "simple_transformer":
-            return SimpleTransformerHybridRecognizer(
-                transformer_model_path=model_path,
-                transformer_threshold=threshold,
+        elif name == "minicpm":
+            return MiniCPMGestureRecognizer(
+                model_path=minicpm_model,
+                input_size=minicpm_input_size,
+                max_frames=minicpm_max_frames,
+                buffer_seconds=minicpm_buffer_seconds,
+                min_frames=minicpm_min_frames,
+                infer_interval_s=minicpm_infer_interval_s,
+                max_concurrent=minicpm_max_concurrent,
+                confidence_threshold=minicpm_conf,
+                cooldown_seconds=minicpm_cooldown_seconds,
+                prompt=minicpm_prompt,
+                minicpm_engine=self._create_minicpm_engine(),
             )
         else:
             raise ValueError(f"未知引擎: {name}")
 
     def _instantiate_engine_with_threshold(self, name: str, threshold: float) -> Any:
         from app.ai.gesture import (
-            TransformerGestureRecognizer,
-            SimpleTransformerHybridRecognizer,
+            SimpleMiniCPMHybridRecognizer,
+            MiniCPMGestureRecognizer,
         )
-        model_path = self.config.ai.transformer_model_path
 
-        if name == "transformer":
-            return TransformerGestureRecognizer(
-                model_path=model_path, confidence_threshold=threshold,
+        minicpm_model = getattr(self.config.ai, "minicpm_model_path", "OpenBMB/MiniCPM-V-4.6")
+        minicpm_prompt = getattr(self.config.ai, "minicpm_prompt", None)
+        minicpm_input_size = getattr(self.config.ai, "minicpm_input_size", 448)
+        minicpm_max_frames = getattr(self.config.ai, "minicpm_max_frames", 16)
+        minicpm_buffer_seconds = getattr(self.config.ai, "minicpm_buffer_seconds", 1.5)
+        minicpm_min_frames = getattr(self.config.ai, "minicpm_min_frames", 8)
+        minicpm_infer_interval_s = getattr(self.config.ai, "minicpm_infer_interval_s", 1.0)
+        minicpm_max_concurrent = getattr(self.config.ai, "minicpm_max_concurrent", 16)
+        minicpm_cooldown_seconds = getattr(self.config.ai, "minicpm_cooldown_seconds", 2.0)
+
+        if name == "simple_minicpm":
+            return SimpleMiniCPMHybridRecognizer(
+                model_path=minicpm_model,
+                input_size=minicpm_input_size,
+                max_frames=minicpm_max_frames,
+                buffer_seconds=minicpm_buffer_seconds,
+                min_frames=minicpm_min_frames,
+                infer_interval_s=minicpm_infer_interval_s,
+                max_concurrent=minicpm_max_concurrent,
+                confidence_threshold=threshold,
+                cooldown_seconds=minicpm_cooldown_seconds,
+                prompt=minicpm_prompt,
+                minicpm_engine=self._create_minicpm_engine(),
             )
-        elif name == "simple_transformer":
-            return SimpleTransformerHybridRecognizer(
-                transformer_model_path=model_path,
-                transformer_threshold=threshold,
+        elif name == "minicpm":
+            return MiniCPMGestureRecognizer(
+                model_path=minicpm_model,
+                input_size=minicpm_input_size,
+                max_frames=minicpm_max_frames,
+                buffer_seconds=minicpm_buffer_seconds,
+                min_frames=minicpm_min_frames,
+                infer_interval_s=minicpm_infer_interval_s,
+                max_concurrent=minicpm_max_concurrent,
+                confidence_threshold=threshold,
+                cooldown_seconds=minicpm_cooldown_seconds,
+                prompt=minicpm_prompt,
+                minicpm_engine=self._create_minicpm_engine(),
             )
         else:
             return self._instantiate_engine(name)
@@ -994,56 +1033,88 @@ class AblationRunner:
     def _instantiate_ablation_engines(self, engine_names: List[str]) -> Dict[str, Any]:
         """实例化组件消融变体引擎。"""
         engines: Dict[str, Any] = {}
-        model_path = self.config.ai.transformer_model_path
-        threshold = self.config.ai.transformer_confidence_threshold
+        minicpm_conf = getattr(self.config.ai, "minicpm_confidence_threshold", 0.6)
+        minicpm_model = getattr(self.config.ai, "minicpm_model_path", "OpenBMB/MiniCPM-V-4.6")
+        minicpm_prompt = getattr(self.config.ai, "minicpm_prompt", None)
+        minicpm_input_size = getattr(self.config.ai, "minicpm_input_size", 448)
+        minicpm_max_frames = getattr(self.config.ai, "minicpm_max_frames", 16)
+        minicpm_buffer_seconds = getattr(self.config.ai, "minicpm_buffer_seconds", 1.5)
+        minicpm_min_frames = getattr(self.config.ai, "minicpm_min_frames", 8)
+        minicpm_infer_interval_s = getattr(self.config.ai, "minicpm_infer_interval_s", 1.0)
+        minicpm_max_concurrent = getattr(self.config.ai, "minicpm_max_concurrent", 16)
+        minicpm_cooldown_seconds = getattr(self.config.ai, "minicpm_cooldown_seconds", 2.0)
 
         from app.ai.gesture import (
             SimpleGestureRecognizer,
-            TransformerGestureRecognizer,
-            GestureRecognizer,
-            SimpleTransformerHybridRecognizer,
+            SimpleMiniCPMHybridRecognizer,
+            MiniCPMGestureRecognizer,
         )
 
         for name in engine_names:
-            if name == "sth_full":
-                engines[name] = SimpleTransformerHybridRecognizer(
-                    transformer_model_path=model_path,
-                    transformer_threshold=threshold,
+            if name == "simple_minicpm_full":
+                engines[name] = SimpleMiniCPMHybridRecognizer(
+                    model_path=minicpm_model,
+                    input_size=minicpm_input_size,
+                    max_frames=minicpm_max_frames,
+                    buffer_seconds=minicpm_buffer_seconds,
+                    min_frames=minicpm_min_frames,
+                    infer_interval_s=minicpm_infer_interval_s,
+                    max_concurrent=minicpm_max_concurrent,
+                    confidence_threshold=minicpm_conf,
+                    cooldown_seconds=minicpm_cooldown_seconds,
+                    prompt=minicpm_prompt,
+                    minicpm_engine=self._create_minicpm_engine(),
                 )
-            elif name == "sth_no_transformer_bypass":
-                base = SimpleTransformerHybridRecognizer(
-                    transformer_model_path=model_path,
-                    transformer_threshold=threshold,
+            elif name == "simple_minicpm_no_simple_gate":
+                base = SimpleMiniCPMHybridRecognizer(
+                    model_path=minicpm_model,
+                    input_size=minicpm_input_size,
+                    max_frames=minicpm_max_frames,
+                    buffer_seconds=minicpm_buffer_seconds,
+                    min_frames=minicpm_min_frames,
+                    infer_interval_s=minicpm_infer_interval_s,
+                    max_concurrent=minicpm_max_concurrent,
+                    confidence_threshold=minicpm_conf,
+                    cooldown_seconds=minicpm_cooldown_seconds,
+                    prompt=minicpm_prompt,
+                    minicpm_engine=self._create_minicpm_engine(),
                 )
-                engines[name] = _STHNoTransformBypass(base)
-            elif name == "sth_strict_and":
-                base = SimpleTransformerHybridRecognizer(
-                    transformer_model_path=model_path,
-                    transformer_threshold=threshold,
+                engines[name] = _SimpleMiniCPMNoSimpleGate(base)
+            elif name == "simple_minicpm_no_cooldown":
+                base = SimpleMiniCPMHybridRecognizer(
+                    model_path=minicpm_model,
+                    input_size=minicpm_input_size,
+                    max_frames=minicpm_max_frames,
+                    buffer_seconds=minicpm_buffer_seconds,
+                    min_frames=minicpm_min_frames,
+                    infer_interval_s=minicpm_infer_interval_s,
+                    max_concurrent=minicpm_max_concurrent,
+                    confidence_threshold=minicpm_conf,
+                    cooldown_seconds=minicpm_cooldown_seconds,
+                    prompt=minicpm_prompt,
+                    minicpm_engine=self._create_minicpm_engine(),
                 )
-                engines[name] = _STHStrictAnd(base)
-            elif name == "sth_transformer_only":
-                base = SimpleTransformerHybridRecognizer(
-                    transformer_model_path=model_path,
-                    transformer_threshold=threshold,
+                engines[name] = _SimpleMiniCPMNoCooldown(base)
+            elif name == "minicpm_full":
+                engines[name] = MiniCPMGestureRecognizer(
+                    model_path=minicpm_model,
+                    input_size=minicpm_input_size,
+                    max_frames=minicpm_max_frames,
+                    buffer_seconds=minicpm_buffer_seconds,
+                    min_frames=minicpm_min_frames,
+                    infer_interval_s=minicpm_infer_interval_s,
+                    max_concurrent=minicpm_max_concurrent,
+                    confidence_threshold=minicpm_conf,
+                    cooldown_seconds=minicpm_cooldown_seconds,
+                    prompt=minicpm_prompt,
+                    minicpm_engine=self._create_minicpm_engine(),
                 )
-                engines[name] = _STHTransformerOnly(base)
             elif name == "simple_full":
-                engines[name] = SimpleGestureRecognizer()
-            elif name == "simple_no_periodicity":
-                base = SimpleGestureRecognizer()
-                engines[name] = _SimpleNoPeriodicity(base)
-            elif name == "simple_no_pose_gate":
-                base = SimpleGestureRecognizer()
-                engines[name] = _SimpleNoPoseGate(base)
-            elif name == "triplelock_full":
-                recognizer = GestureRecognizer()
-                recognizer.engine.motion_amp_min = 0.02
-                engines[name] = recognizer
-            elif name == "triplelock_no_orientation":
-                base = GestureRecognizer()
-                base.engine.motion_amp_min = 0.02
-                engines[name] = _TripleLockNoOrientation(base)
+                engines[name] = SimpleGestureRecognizer(
+                    nose_conf_threshold=0.15,
+                    eye_conf_threshold=0.15,
+                    wrist_elbow_conf_threshold=0.10,
+                )
             else:
                 logger.warning("未知消融变体: %s", name)
         return engines

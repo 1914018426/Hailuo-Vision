@@ -12,23 +12,26 @@ function getGestureBadgeColor(gesture: Gesture): string {
       return 'bg-slate-500/80 text-white';
     case 'waving':
       return 'bg-red-500/80 text-white';
+    case 'checking':
+      return 'bg-orange-500/80 text-white';
     default:
       return 'bg-slate-600/60 text-slate-300';
   }
 }
 
 export function GestureOverlay({ detection }: GestureOverlayProps) {
-  if (detection.best_gesture === 'none') return null;
-  // 用 HTML div 替代 SVG <rect>：SVG 元素的 Tailwind bg-* 不生效，会回退默认黑色 fill
+  // 始终渲染占位，避免 none/checking 切换时高度跳变导致画面抖动
+  const isNone = detection.best_gesture === 'none';
   return (
     <div
       className={cn(
         'absolute top-2 right-2 z-10 pointer-events-none',
-        'px-2 py-0.5 rounded-md text-[11px] font-semibold animate-fade-in',
+        'px-2 py-0.5 rounded-md text-[11px] font-semibold',
+        isNone ? 'opacity-0' : 'opacity-100 animate-fade-in',
         getGestureBadgeColor(detection.best_gesture)
       )}
     >
-      {GESTURE_LABELS[detection.best_gesture]}
+      {GESTURE_LABELS[detection.best_gesture] ?? ''}
     </div>
   );
 }

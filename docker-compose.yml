@@ -13,6 +13,9 @@ services:
     environment:
       # Hugging Face 国内镜像
       - HF_ENDPOINT=https://hf-mirror.com
+      # 已下载模型权重到本地缓存，彻底离线避免启动时网络检查
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
       # Ultralytics 用户配置目录（可写，避免落到 /tmp）
       - YOLO_CONFIG_DIR=/app/.ultralytics
       # --- AI 推理参数 ---
@@ -79,17 +82,35 @@ services:
       - GESTURE_EMA_ALPHA=0.35
       - GESTURE_CONFIDENCE_THRESHOLD=0.55
       # --- Transformer 手势引擎 ---
-      # 引擎模式: "triplelock" | "simple" | "transformer" | "simple-transformer" | "hybrid"
+      # 引擎模式: "triplelock" | "simple" | "transformer" | "simple-transformer" | "hybrid" | "simple-minicpm"
       # simple-transformer：Simple 为主，Transformer 为辅
-      - GESTURE_ENGINE=simple-transformer
+      # simple-minicpm：Simple trigger + MiniCPM 视频推理
+      - GESTURE_ENGINE=simple-minicpm
       - TRANSFORMER_MODEL_PATH=/app/models/transformer/waving_transformer_real.pt
       - TRANSFORMER_CONFIDENCE_THRESHOLD=0.5
+      # --- MiniCPM 视频手势引擎 ---
+      - MINICPM_MODEL_PATH=OpenBMB/MiniCPM-V-4.6
+      - MINICPM_INPUT_SIZE=448
+      - MINICPM_MAX_FRAMES=16
+      - MINICPM_BUFFER_SECONDS=1.5
+      - MINICPM_MIN_FRAMES=8
+      - MINICPM_INFER_INTERVAL_S=0.2
+      - MINICPM_MAX_CONCURRENT=16
+      - MINICPM_CONFIDENCE_THRESHOLD=0.6
+      - MINICPM_COOLDOWN_SECONDS=2.0
     # 数据持久化：模型与配置挂载到宿主机，避免重建时重复下载
     volumes:
+      # 实时同步代码（不重建镜像时生效）
+      # 注意：容器内代码在 /app/app/ 下（uvicorn app.main:app 的解析路径）
+      - ./backend/app/ai:/app/app/ai:rw
+      - ./backend/app/datalab:/app/app/datalab:rw
+      - ./backend/app/config.py:/app/app/config.py:rw
       - ./models:/app/models:rw
       - ./.ultralytics:/app/.ultralytics:rw
       - ./datasets:/app/datasets:ro
       - ./data:/app/data:rw
+      # HuggingFace / ModelScope 缓存：避免每次重启重新下载 MiniCPM 模型
+      - ./hf-cache:/root/.cache/huggingface:rw
     deploy:
       resources:
         reservations:
@@ -118,6 +139,8 @@ services:
     restart: unless-stopped
     ports:
       - "5173:80"
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:rw
     depends_on:
       - backend
     networks:

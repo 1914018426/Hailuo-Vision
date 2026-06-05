@@ -15,22 +15,20 @@ import type { AblationExperiment, ExperimentType } from './types';
 
 const ENGINE_OPTIONS = [
   { key: 'simple', label: 'Simple' },
-  { key: 'transformer', label: 'Transformer' },
-  { key: 'triplelock', label: 'TripleLock' },
-  { key: 'transformer_triplelock', label: 'Transformer+TripleLock' },
-  { key: 'simple_transformer', label: 'Simple+Transformer ★' },
+  { key: 'simple_minicpm', label: 'Simple+MiniCPM ★' },
+  { key: 'minicpm', label: 'MiniCPM' },
 ];
 
 const EXPERIMENT_TYPE_OPTIONS: { key: ExperimentType; label: string; desc: string }[] = [
   {
     key: 'engine_comparison',
     label: '引擎横向对比',
-    desc: '5 个主引擎在相同输入下的表现对比',
+    desc: '3 个主引擎在相同输入下的表现对比',
   },
   {
     key: 'component_ablation',
     label: '组件消融',
-    desc: '逐一移除 STH/Simple/TripleLock 的组件，量化各组件贡献',
+    desc: '逐一移除 Simple+MiniCPM 的组件，量化各组件贡献',
   },
   {
     key: 'threshold_sweep',

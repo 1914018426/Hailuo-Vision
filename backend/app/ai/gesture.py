@@ -16,6 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 
+import cv2
 import numpy as np
 
 from app.config import get_config
@@ -908,6 +909,7 @@ class SimpleGestureEngine:
         self,
         nose_conf_threshold: float = 0.3,
         eye_conf_threshold: float = 0.3,
+        wrist_elbow_conf_threshold: float = 0.3,
         period_window_seconds: float = 2.5,
         fps: float = 15.0,
         min_freq_hz: float = 0.35,
@@ -920,6 +922,7 @@ class SimpleGestureEngine:
     ) -> None:
         self.nose_conf_threshold = nose_conf_threshold
         self.eye_conf_threshold = eye_conf_threshold
+        self.wrist_elbow_conf_threshold = wrist_elbow_conf_threshold
         self.period_window = period_window_seconds
         self.fps = fps
         self.min_freq_hz = min_freq_hz
@@ -978,7 +981,7 @@ class SimpleGestureEngine:
 
         elbow_conf = float(keypoints[elbow_idx, 2])
         wrist_conf = float(keypoints[wrist_idx, 2])
-        if elbow_conf < 0.3 or wrist_conf < 0.3:
+        if elbow_conf < self.wrist_elbow_conf_threshold or wrist_conf < self.wrist_elbow_conf_threshold:
             self._reset(k)
             return "none", 0.0
 
@@ -1146,6 +1149,43 @@ class SimpleGestureEngine:
         self._ema_conf.clear()
         self._last_result.clear()
 
+    def check_trigger_only(self, keypoints: np.ndarray) -> bool:
+        """
+        仅检查 Simple 引擎的前 3 个条件（面部 + 手肘高于手腕），
+        不做周期性检测。用作 MiniCPM 引擎的 trigger。
+        """
+        if keypoints is None or len(keypoints) < 17:
+            return False
+        # 鼻子可见
+        nose_conf = float(keypoints[0, 2])
+        if nose_conf < self.nose_conf_threshold:
+            logger.info("check_trigger: nose_conf=%.2f < %.2f", nose_conf, self.nose_conf_threshold)
+            return False
+        # 至少一只眼睛可见
+        left_eye_conf = float(keypoints[1, 2]) if len(keypoints) > 1 else 0.0
+        right_eye_conf = float(keypoints[2, 2]) if len(keypoints) > 2 else 0.0
+        if left_eye_conf < self.eye_conf_threshold and right_eye_conf < self.eye_conf_threshold:
+            logger.info("check_trigger: eye_conf left=%.2f right=%.2f < %.2f", left_eye_conf, right_eye_conf, self.eye_conf_threshold)
+            return False
+        # 至少一侧手腕高于手肘（允许 10px 容差，应对手臂弯曲时的投影误差）
+        WRIST_ELBOW_CONF = 0.10
+        WRIST_ELBOW_PIX_TOL = 10.0
+        for side in ("left", "right"):
+            elbow_idx, wrist_idx = (7, 9) if side == "left" else (8, 10)
+            elbow_conf = float(keypoints[elbow_idx, 2])
+            wrist_conf = float(keypoints[wrist_idx, 2])
+            if elbow_conf < WRIST_ELBOW_CONF or wrist_conf < WRIST_ELBOW_CONF:
+                logger.info("check_trigger %s: conf elbow=%.2f wrist=%.2f < %.2f", side, elbow_conf, wrist_conf, WRIST_ELBOW_CONF)
+                continue
+            wrist_y = float(keypoints[wrist_idx, 1])
+            elbow_y = float(keypoints[elbow_idx, 1])
+            if wrist_y <= elbow_y + WRIST_ELBOW_PIX_TOL:
+                logger.info("check_trigger %s: triggered wrist_y=%.1f <= elbow_y=%.1f + %.1f", side, wrist_y, elbow_y, WRIST_ELBOW_PIX_TOL)
+                return True
+            else:
+                logger.info("check_trigger %s: wrist_y=%.1f > elbow_y=%.1f + %.1f, not triggered", side, wrist_y, elbow_y, WRIST_ELBOW_PIX_TOL)
+        return False
+
 
 class SimpleGestureRecognizer:
     """
@@ -1153,6 +1193,7 @@ class SimpleGestureRecognizer:
     """
 
     def __init__(self, nose_conf_threshold: float = 0.25, eye_conf_threshold: float = 0.25,
+                 wrist_elbow_conf_threshold: float = 0.3,
                  period_window_seconds: float = 2.5,
                  fps: float = 15.0, min_freq_hz: float = 0.35, max_freq_hz: float = 3.0,
                  min_cycles: int = 2, min_confirm_frames: int = 3, hold_frames: int = 15,
@@ -1160,6 +1201,7 @@ class SimpleGestureRecognizer:
         self.engine = SimpleGestureEngine(
             nose_conf_threshold=nose_conf_threshold,
             eye_conf_threshold=eye_conf_threshold,
+            wrist_elbow_conf_threshold=wrist_elbow_conf_threshold,
             period_window_seconds=period_window_seconds,
             fps=fps,
             min_freq_hz=min_freq_hz,
@@ -1228,7 +1270,7 @@ class SimpleGestureRecognizer:
     def reset(self) -> None:
         self.engine.reset_all()
 
-def _choose_recognizer() -> "GestureRecognizer | TransformerGestureRecognizer | SimpleGestureRecognizer | SimpleTransformerHybridRecognizer | HybridGestureRecognizer":
+def _choose_recognizer() -> "GestureRecognizer | TransformerGestureRecognizer | SimpleGestureRecognizer | SimpleTransformerHybridRecognizer | HybridGestureRecognizer | SimpleMiniCPMHybridRecognizer":
     """根据配置选择手势识别引擎。"""
     config = get_config()
     engine_mode = config.ai.gesture_engine.lower()
@@ -1279,6 +1321,42 @@ def _choose_recognizer() -> "GestureRecognizer | TransformerGestureRecognizer | 
         except Exception as e:
             logger.warning("Hybrid 引擎初始化失败 (%s)，回退到 TripleLock 引擎", e)
             return GestureRecognizer()
+    elif engine_mode == "simple-minicpm":
+        logger.info("使用 Simple+MiniCPM 混合手势引擎")
+        try:
+            return SimpleMiniCPMHybridRecognizer(
+                model_path=config.ai.minicpm_model_path,
+                input_size=config.ai.minicpm_input_size,
+                max_frames=config.ai.minicpm_max_frames,
+                buffer_seconds=config.ai.minicpm_buffer_seconds,
+                min_frames=config.ai.minicpm_min_frames,
+                infer_interval_s=config.ai.minicpm_infer_interval_s,
+                max_concurrent=config.ai.minicpm_max_concurrent,
+                confidence_threshold=config.ai.minicpm_confidence_threshold,
+                cooldown_seconds=config.ai.minicpm_cooldown_seconds,
+                prompt=config.ai.minicpm_prompt,
+            )
+        except Exception as e:
+            logger.warning("Simple+MiniCPM 混合引擎初始化失败 (%s)，回退到 Simple 引擎", e)
+            return SimpleGestureRecognizer()
+    elif engine_mode == "minicpm":
+        logger.info("使用纯 MiniCPM 手势引擎")
+        try:
+            return MiniCPMGestureRecognizer(
+                model_path=config.ai.minicpm_model_path,
+                input_size=config.ai.minicpm_input_size,
+                max_frames=config.ai.minicpm_max_frames,
+                buffer_seconds=config.ai.minicpm_buffer_seconds,
+                min_frames=config.ai.minicpm_min_frames,
+                infer_interval_s=config.ai.minicpm_infer_interval_s,
+                max_concurrent=config.ai.minicpm_max_concurrent,
+                confidence_threshold=config.ai.minicpm_confidence_threshold,
+                cooldown_seconds=config.ai.minicpm_cooldown_seconds,
+                prompt=config.ai.minicpm_prompt,
+            )
+        except Exception as e:
+            logger.warning("MiniCPM 引擎初始化失败 (%s)，回退到 Simple 引擎", e)
+            return SimpleGestureRecognizer()
     else:
         return GestureRecognizer()
 
@@ -1478,6 +1556,483 @@ class SimpleTransformerHybridRecognizer:
             self.transformer.reset()
 
 
+class SimpleMiniCPMHybridRecognizer:
+    """
+    Simple + MiniCPM 混合手势识别器（流式视频推理）。
+
+    - Simple（面部 + 手肘高于手腕）做 trigger
+    - trigger 满足后持续积累人物区域的视频帧（滑动窗口）
+    - 定期将窗口帧送入 MiniCPM 做视频级招手判定
+    - 结果异步更新，recognize() 立即返回缓存结果，不阻塞主流程
+    """
+
+    def __init__(
+        self,
+        model_path: str = "OpenBMB/MiniCPM-V-4.6",
+        input_size: int = 448,
+        max_frames: int = 16,
+        buffer_seconds: float = 1.5,
+        min_frames: int = 8,
+        infer_interval_s: float = 1.0,
+        max_concurrent: int = 16,
+        confidence_threshold: float = 0.6,
+        cooldown_seconds: float = 2.0,
+        prompt: Optional[str] = None,
+        minicpm_engine: Optional[Any] = None,
+    ) -> None:
+        # Simple trigger 阈值放得很宽：只要能看到鼻子/眼睛 + 手腕在手肘上方即可触发
+        self._simple = SimpleGestureEngine(
+            nose_conf_threshold=0.15,
+            eye_conf_threshold=0.15,
+        )
+        self._input_size = input_size
+        self._max_frames = max_frames
+        self._buffer_seconds = buffer_seconds
+        self._min_frames = min_frames
+        self._infer_interval_s = infer_interval_s
+        self._cooldown_seconds = cooldown_seconds
+
+        # 帧缓冲区：track_id -> deque of (timestamp, cropped_frame, frame_idx)
+        self._buffers: Dict[str, deque] = {}
+        self._last_infer_ts: Dict[str, float] = {}
+        self._cooldown_until: Dict[str, float] = {}
+        # 推理窗口记录：track_id -> List[(start_frame_idx, end_frame_idx)]
+        self._inference_windows: Dict[str, List[Tuple[int, int]]] = {}
+
+        # MiniCPM 推理引擎（支持外部传入共享实例，避免多实例并发加载导致模型损坏）
+        if minicpm_engine is not None:
+            self._minicpm = minicpm_engine
+            self._has_minicpm = True
+            logger.info(
+                "SimpleMiniCPMHybridRecognizer: simple trigger + 共享 MiniCPM "
+                "input=%d max_frames=%d buffer=%.1fs min_frames=%d interval=%.2fs",
+                input_size, max_frames, buffer_seconds, min_frames, infer_interval_s,
+            )
+        else:
+            try:
+                from app.ai.minicpm_engine import MiniCPMEngine
+                self._minicpm = MiniCPMEngine(
+                    model_path=model_path,
+                    max_concurrent=max_concurrent,
+                    confidence_threshold=confidence_threshold,
+                    prompt=prompt,
+                )
+                self._has_minicpm = True
+                logger.info(
+                    "SimpleMiniCPMHybridRecognizer: simple trigger + MiniCPM(%s) "
+                    "input=%d max_frames=%d buffer=%.1fs min_frames=%d interval=%.2fs concurrent=%d",
+                    model_path, input_size, max_frames, buffer_seconds, min_frames,
+                    infer_interval_s, max_concurrent,
+                )
+            except Exception as e:
+                logger.warning("MiniCPM 引擎初始化失败 (%s)，回退到纯 Simple 模式", e)
+                self._minicpm = None
+                self._has_minicpm = False
+
+    def recognize(
+        self,
+        keypoints: np.ndarray,
+        track_id: str = "default",
+        left_palm_normal: Optional[np.ndarray] = None,
+        right_palm_normal: Optional[np.ndarray] = None,
+        frame_timestamp: Optional[float] = None,
+        active_track_ids: Optional[set] = None,
+        left_wrist_local: Optional[np.ndarray] = None,
+        right_wrist_local: Optional[np.ndarray] = None,
+        left_tnlf_valid: bool = False,
+        right_tnlf_valid: bool = False,
+        left_velocity_mag: float = 0.0,
+        right_velocity_mag: float = 0.0,
+        left_theta1: float = 0.0, left_theta2: float = 0.0, left_ext_ratio: float = 0.0,
+        right_theta1: float = 0.0, right_theta2: float = 0.0, right_ext_ratio: float = 0.0,
+        frame: Optional[np.ndarray] = None,
+        bbox: Optional[Tuple[int, int, int, int]] = None,
+        frame_idx: int = 0,
+        **_kwargs,
+    ) -> "GestureResult":
+        now = frame_timestamp if frame_timestamp is not None else time.time()
+
+        # 1. Simple trigger：面部 + 手肘高于手腕
+        triggered = self._simple.check_trigger_only(keypoints)
+
+        # 2. 清理过期状态
+        if active_track_ids is not None:
+            stale = [
+                tid for tid in list(self._buffers.keys())
+                if tid not in active_track_ids
+            ]
+            for tid in stale:
+                self._buffers.pop(tid, None)
+                self._last_infer_ts.pop(tid, None)
+                self._cooldown_until.pop(tid, None)
+                self._inference_windows.pop(tid, None)
+            if self._has_minicpm:
+                self._minicpm.cleanup_stale(active_track_ids)
+
+        if not triggered:
+            # trigger 不满足，清空该 track 的缓冲区
+            if track_id in self._buffers:
+                del self._buffers[track_id]
+                self._last_infer_ts.pop(track_id, None)
+                self._inference_windows.pop(track_id, None)
+            logger.debug("SimpleMiniCPM[%s]: trigger=false, 直接返回 NONE", track_id)
+            return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
+
+        logger.debug("SimpleMiniCPM[%s]: trigger=true, 积累帧", track_id)
+
+        # 3. 积累帧
+        if frame is not None and bbox is not None:
+            self._buffer_frame(track_id, frame, bbox, now, frame_idx)
+
+        # 4. 检查是否满足推理条件
+        self._maybe_submit(track_id, now)
+
+        # 5. 返回 MiniCPM 缓存结果（或 CHECKING）
+        if self._has_minicpm:
+            gesture, conf = self._minicpm.get_result_at(track_id, frame_idx)
+            logger.info(
+                "SimpleMiniCPM[%s]: get_result_at frame_idx=%d gesture=%s conf=%.2f",
+                track_id, frame_idx, gesture, conf,
+            )
+            if gesture == "waving":
+                return GestureResult(gesture_type=GestureType.WAVING, confidence=conf)
+            # trigger 已满足且正在积累帧 / 等待推理结果：显示"检测中"
+            if track_id in self._buffers:
+                return GestureResult(gesture_type=GestureType.CHECKING, confidence=0.5)
+        return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
+
+    def _buffer_frame(
+        self,
+        track_id: str,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        timestamp: float,
+        frame_idx: int = 0,
+    ) -> None:
+        """将人物区域裁剪并缩放后存入滑动窗口。"""
+        x1, y1, x2, y2 = bbox
+        # 边界检查
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+
+        # 等比例缩放到短边为 input_size
+        ch, cw = crop.shape[:2]
+        scale = self._input_size / min(ch, cw)
+        new_h, new_w = int(ch * scale), int(cw * scale)
+        resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # 初始化缓冲区
+        if track_id not in self._buffers:
+            max_len = int(self._buffer_seconds * 15) + 5  # 按 15fps 估算，留余量
+            self._buffers[track_id] = deque(maxlen=max(max_len, 30))
+
+        self._buffers[track_id].append((timestamp, resized, frame_idx))
+
+    def _maybe_submit(self, track_id: str, now: float) -> None:
+        """检查是否满足 MiniCPM 推理条件，满足则提交。"""
+        if not self._has_minicpm:
+            logger.info("SimpleMiniCPM[%s]: _maybe_submit skip, _has_minicpm=False", track_id)
+            return
+
+        buf = self._buffers.get(track_id)
+        if buf is None:
+            logger.info("SimpleMiniCPM[%s]: _maybe_submit skip, buf=None", track_id)
+            return
+        if len(buf) < self._min_frames:
+            logger.info("SimpleMiniCPM[%s]: _maybe_submit skip, buf_len=%d < min_frames=%d", track_id, len(buf), self._min_frames)
+            return
+
+        # 冷却期检查
+        cooldown = self._cooldown_until.get(track_id, 0)
+        if now < cooldown:
+            logger.info("SimpleMiniCPM[%s]: _maybe_submit skip, in cooldown %.1fs", track_id, cooldown - now)
+            return
+
+        # 推理间隔检查
+        last_ts = self._last_infer_ts.get(track_id, 0)
+        if now - last_ts < self._infer_interval_s:
+            logger.info("SimpleMiniCPM[%s]: _maybe_submit skip, interval %.2fs < %.2fs", track_id, now - last_ts, self._infer_interval_s)
+            return
+
+        # 均匀抽帧
+        frames = [f for _ts, f, _idx in buf]
+        frame_indices = [idx for _ts, _f, idx in buf]
+        if len(frames) > self._max_frames:
+            indices = np.linspace(0, len(frames) - 1, self._max_frames, dtype=int)
+            frames = [frames[i] for i in indices]
+            used_indices = [frame_indices[i] for i in indices]
+        else:
+            used_indices = frame_indices
+
+        self._last_infer_ts[track_id] = now
+        self._minicpm.submit(track_id, frames, frame_indices=used_indices)
+        # 记录本次推理覆盖的帧窗口
+        window_start = int(min(used_indices))
+        window_end = int(max(used_indices))
+        self._inference_windows.setdefault(track_id, []).append((window_start, window_end))
+        logger.info(
+            "SimpleMiniCPM[%s]: 提交推理, frames=%d, window=[%d, %d]",
+            track_id, len(frames), window_start, window_end,
+        )
+
+        # 如果 MiniCPM 已确认 waving，设置冷却期
+        gesture, conf = self._minicpm.get_result(track_id)
+        if gesture == "waving" and conf >= 0.6:
+            self._cooldown_until[track_id] = now + self._cooldown_seconds
+
+    def get_inference_windows(self, track_id: str) -> List[Tuple[int, int, str, float]]:
+        """获取该 track 的所有推理窗口及其结果。"""
+        if self._has_minicpm and self._minicpm is not None:
+            return self._minicpm.get_inference_windows(track_id)
+        return []
+
+    def wait_for_result(self, track_id: str, timeout: float = 30.0) -> Tuple[str, float]:
+        """阻塞等待该 track 的 MiniCPM 推理完成。"""
+        if not self._has_minicpm or self._minicpm is None:
+            return "none", 0.0
+        return self._minicpm.wait_for_result(track_id, timeout=timeout)
+
+    def get_buffer_length(self, track_id: str) -> int:
+        """获取该 track 的帧缓冲区长度。"""
+        buf = self._buffers.get(track_id)
+        return len(buf) if buf else 0
+
+    def reset(self) -> None:
+        self._simple.reset_all()
+        self._buffers.clear()
+        self._last_infer_ts.clear()
+        self._cooldown_until.clear()
+        self._inference_windows.clear()
+        if self._has_minicpm and self._minicpm:
+            self._minicpm.reset()
+
+
+class MiniCPMGestureRecognizer:
+    """
+    纯 MiniCPM 手势识别器（无 Simple trigger，直接视频推理）。
+
+    - 只要有 bbox 和 frame 就持续积累人物区域的视频帧（滑动窗口）
+    - 定期将窗口帧送入 MiniCPM 做视频级招手判定
+    - 结果异步更新，recognize() 立即返回缓存结果，不阻塞主流程
+    """
+
+    def __init__(
+        self,
+        model_path: str = "OpenBMB/MiniCPM-V-4.6",
+        input_size: int = 448,
+        max_frames: int = 16,
+        buffer_seconds: float = 1.5,
+        min_frames: int = 8,
+        infer_interval_s: float = 1.0,
+        max_concurrent: int = 16,
+        confidence_threshold: float = 0.6,
+        cooldown_seconds: float = 2.0,
+        prompt: Optional[str] = None,
+        minicpm_engine: Optional[Any] = None,
+    ) -> None:
+        self._input_size = input_size
+        self._max_frames = max_frames
+        self._buffer_seconds = buffer_seconds
+        self._min_frames = min_frames
+        self._infer_interval_s = infer_interval_s
+        self._cooldown_seconds = cooldown_seconds
+
+        # 帧缓冲区：track_id -> deque of (timestamp, cropped_frame, frame_idx)
+        self._buffers: Dict[str, deque] = {}
+        self._last_infer_ts: Dict[str, float] = {}
+        self._cooldown_until: Dict[str, float] = {}
+        # 推理窗口记录：track_id -> List[(start_frame_idx, end_frame_idx)]
+        self._inference_windows: Dict[str, List[Tuple[int, int]]] = {}
+
+        # MiniCPM 推理引擎（支持外部传入共享实例，避免多实例并发加载导致模型损坏）
+        if minicpm_engine is not None:
+            self._minicpm = minicpm_engine
+            self._has_minicpm = True
+            logger.info(
+                "MiniCPMGestureRecognizer: 纯 共享 MiniCPM "
+                "input=%d max_frames=%d buffer=%.1fs min_frames=%d interval=%.2fs",
+                input_size, max_frames, buffer_seconds, min_frames, infer_interval_s,
+            )
+        else:
+            try:
+                from app.ai.minicpm_engine import MiniCPMEngine
+                self._minicpm = MiniCPMEngine(
+                    model_path=model_path,
+                    max_concurrent=max_concurrent,
+                    confidence_threshold=confidence_threshold,
+                    prompt=prompt,
+                )
+                self._has_minicpm = True
+                logger.info(
+                    "MiniCPMGestureRecognizer: 纯 MiniCPM(%s) input=%d max_frames=%d "
+                    "buffer=%.1fs min_frames=%d interval=%.2fs concurrent=%d",
+                    model_path, input_size, max_frames, buffer_seconds, min_frames,
+                    infer_interval_s, max_concurrent,
+                )
+            except Exception as e:
+                logger.warning("MiniCPM 引擎初始化失败 (%s)，回退到 NONE 模式", e)
+                self._minicpm = None
+                self._has_minicpm = False
+
+    def recognize(
+        self,
+        keypoints: np.ndarray,
+        track_id: str = "default",
+        left_palm_normal: Optional[np.ndarray] = None,
+        right_palm_normal: Optional[np.ndarray] = None,
+        frame_timestamp: Optional[float] = None,
+        active_track_ids: Optional[set] = None,
+        left_wrist_local: Optional[np.ndarray] = None,
+        right_wrist_local: Optional[np.ndarray] = None,
+        left_tnlf_valid: bool = False,
+        right_tnlf_valid: bool = False,
+        left_velocity_mag: float = 0.0,
+        right_velocity_mag: float = 0.0,
+        left_theta1: float = 0.0, left_theta2: float = 0.0, left_ext_ratio: float = 0.0,
+        right_theta1: float = 0.0, right_theta2: float = 0.0, right_ext_ratio: float = 0.0,
+        frame: Optional[np.ndarray] = None,
+        bbox: Optional[Tuple[int, int, int, int]] = None,
+        frame_idx: int = 0,
+        **_kwargs,
+    ) -> "GestureResult":
+        now = frame_timestamp if frame_timestamp is not None else time.time()
+
+        # 1. 清理过期状态
+        if active_track_ids is not None:
+            stale = [
+                tid for tid in list(self._buffers.keys())
+                if tid not in active_track_ids
+            ]
+            for tid in stale:
+                self._buffers.pop(tid, None)
+                self._last_infer_ts.pop(tid, None)
+                self._cooldown_until.pop(tid, None)
+                self._inference_windows.pop(tid, None)
+            if self._has_minicpm:
+                self._minicpm.cleanup_stale(active_track_ids)
+
+        # 2. 无帧数据则无法推理
+        if frame is None or bbox is None:
+            return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
+
+        # 3. 积累帧
+        self._buffer_frame(track_id, frame, bbox, now, frame_idx)
+
+        # 4. 检查是否满足推理条件
+        self._maybe_submit(track_id, now)
+
+        # 5. 返回 MiniCPM 缓存结果
+        if self._has_minicpm:
+            gesture, conf = self._minicpm.get_result_at(track_id, frame_idx)
+            if gesture == "waving":
+                return GestureResult(gesture_type=GestureType.WAVING, confidence=conf)
+            # 正在积累帧 / 等待推理结果：显示"检测中"
+            if track_id in self._buffers:
+                return GestureResult(gesture_type=GestureType.CHECKING, confidence=0.5)
+        return GestureResult(gesture_type=GestureType.NONE, confidence=0.0)
+
+    def _buffer_frame(
+        self,
+        track_id: str,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        timestamp: float,
+        frame_idx: int = 0,
+    ) -> None:
+        """将人物区域裁剪并缩放后存入滑动窗口。"""
+        x1, y1, x2, y2 = bbox
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+
+        ch, cw = crop.shape[:2]
+        scale = self._input_size / min(ch, cw)
+        new_h, new_w = int(ch * scale), int(cw * scale)
+        resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        if track_id not in self._buffers:
+            max_len = int(self._buffer_seconds * 15) + 5
+            self._buffers[track_id] = deque(maxlen=max(max_len, 30))
+
+        self._buffers[track_id].append((timestamp, resized, frame_idx))
+
+    def _maybe_submit(self, track_id: str, now: float) -> None:
+        """检查是否满足 MiniCPM 推理条件，满足则提交。"""
+        if not self._has_minicpm:
+            return
+
+        buf = self._buffers.get(track_id)
+        if buf is None:
+            return
+        if len(buf) < self._min_frames:
+            return
+
+        cooldown = self._cooldown_until.get(track_id, 0)
+        if now < cooldown:
+            return
+
+        last_ts = self._last_infer_ts.get(track_id, 0)
+        if now - last_ts < self._infer_interval_s:
+            return
+
+        frames = [f for _ts, f, _idx in buf]
+        frame_indices = [idx for _ts, _f, idx in buf]
+        if len(frames) > self._max_frames:
+            indices = np.linspace(0, len(frames) - 1, self._max_frames, dtype=int)
+            frames = [frames[i] for i in indices]
+            used_indices = [frame_indices[i] for i in indices]
+        else:
+            used_indices = frame_indices
+
+        self._last_infer_ts[track_id] = now
+        self._minicpm.submit(track_id, frames, frame_indices=used_indices)
+        window_start = int(min(used_indices))
+        window_end = int(max(used_indices))
+        self._inference_windows.setdefault(track_id, []).append((window_start, window_end))
+
+        gesture, conf = self._minicpm.get_result(track_id)
+        if gesture == "waving" and conf >= 0.6:
+            self._cooldown_until[track_id] = now + self._cooldown_seconds
+
+    def get_inference_windows(self, track_id: str) -> List[Tuple[int, int, str, float]]:
+        """获取该 track 的所有推理窗口及其结果。"""
+        if self._has_minicpm and self._minicpm is not None:
+            return self._minicpm.get_inference_windows(track_id)
+        return []
+
+    def wait_for_result(self, track_id: str, timeout: float = 30.0) -> Tuple[str, float]:
+        """阻塞等待该 track 的 MiniCPM 推理完成。"""
+        if not self._has_minicpm or self._minicpm is None:
+            return "none", 0.0
+        return self._minicpm.wait_for_result(track_id, timeout=timeout)
+
+    def get_buffer_length(self, track_id: str) -> int:
+        """获取该 track 的帧缓冲区长度。"""
+        buf = self._buffers.get(track_id)
+        return len(buf) if buf else 0
+
+    def reset(self) -> None:
+        self._buffers.clear()
+        self._last_infer_ts.clear()
+        self._cooldown_until.clear()
+        self._inference_windows.clear()
+        if self._has_minicpm and self._minicpm:
+            self._minicpm.reset()
+
+
 # =============================================================================
 # 手势类型与结果定义
 # =============================================================================
@@ -1488,6 +2043,7 @@ class GestureType(str, Enum):
     GREETING = "greeting"
     HAILING = "hailing"
     HAND_UP = "hand_up"
+    CHECKING = "checking"  # MiniCPM 正在分析中
 
 
 @dataclass
